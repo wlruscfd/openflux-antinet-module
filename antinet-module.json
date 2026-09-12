@@ -1,0 +1,13 @@
+{
+  "version": "1.0.0",
+  "android": {
+    "arm64-v8a": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.0/openflux-android-arm64-v8a.zip",
+    "armeabi-v7a": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.0/openflux-android-armeabi-v7a.zip"
+  },
+  "desktop": {
+    "windows_amd64": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.0/openflux-windows_amd64.zip",
+    "linux_amd64": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.0/openflux-linux_amd64.zip",
+    "darwin_amd64": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.0/openflux-darwin_amd64.zip"
+  },
+  "changelog": "1.0.0: disk.yandex.ru share links accepted (auto-rewritten to docs.yandex.ru); realistic browser fingerprint on requests to Yandex (was sending just \"Mozilla/5.0\" with no other headers, an easy bot-detection signal); self-echo filtering, real exponential reconnect backoff, and a writerLoop fix ported from openflux-server."
+}

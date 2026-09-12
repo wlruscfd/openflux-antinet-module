@@ -1,11 +1,13 @@
 {
   "version": "1.0.0",
   "android": {
-    "arm64-v8a": "https://<host>/openflux-android-arm64-v8a.zip"
+    "arm64-v8a": "https://<host>/openflux-android-arm64-v8a.zip",
+    "armeabi-v7a": "https://<host>/openflux-android-armeabi-v7a.zip"
   },
   "desktop": {
     "windows_amd64": "https://<host>/openflux-windows_amd64.zip",
-    "linux_amd64": "https://<host>/openflux-linux_amd64.zip"
+    "linux_amd64": "https://<host>/openflux-linux_amd64.zip",
+    "darwin_amd64": "https://<host>/openflux-darwin_amd64.zip"
   },
   "changelog": "что нового в этой версии"
 }

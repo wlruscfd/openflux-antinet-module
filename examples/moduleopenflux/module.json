@@ -6,7 +6,7 @@
   "name": "OpenFlux",
   "description": "TCP-туннель поверх мессенджеров: трафик уходит сообщениями курсора Яндекс.Документов либо сигнальным каналом звонка MAX. Транспорт выбирается ссылкой. Требуется свой exit-node OpenFlux.",
   "homepage": "https://github.com/p1neappleXpress/OpenFlux",
-  "updateUrl": "",
+  "updateUrl": "https://raw.githubusercontent.com/wlruscfd/openflux-antinet-module/main/antinet-module.json",
   "version": "1.0.0",
   "license": "GPL-3.0-or-later",
   "handoverMode": "restart",
