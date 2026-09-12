@@ -9,6 +9,7 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	neturl "net/url"
 	"regexp"
 	"strings"
 	"sync"
@@ -77,11 +78,62 @@ type YandexDocsTransport struct {
 func NewYandexDocsTransport(url string, config transport.TransportConfig, dial transport.DialContextFunc) *YandexDocsTransport {
 	t := &YandexDocsTransport{
 		BaseTransport: transport.NewBaseTransport(config),
-		url:           url,
+		url:           normalizeDocURL(url),
 		dial:          dial,
 	}
 	t.baseUserID = randUserID()
 	return t
+}
+
+// normalizeDocURL rewrites a Yandex Disk share link into the equivalent
+// Yandex Docs URL fetchDocInfo actually knows how to fetch. A disk.yandex.ru
+// "/i/<hash>" share link and the docs.yandex.ru edit link serve the same
+// client-config-bearing page for a supported document, just under
+// different hostnames - a plain host swap is all that's needed, path and
+// query string carry over untouched. Ported from openflux-server (this
+// module's sibling project), where the same disk.yandex.ru share links
+// users naturally get from Yandex Disk's own "share" button needed the
+// same fix. Anything else (a different host, a malformed URL, a
+// disk.yandex.ru path that isn't a share link) passes through unchanged
+// and is left for the actual HTTP fetch to accept or reject.
+func normalizeDocURL(raw string) string {
+	u, err := neturl.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	if strings.EqualFold(u.Hostname(), "disk.yandex.ru") && strings.HasPrefix(u.Path, "/i/") {
+		u.Host = "docs.yandex.ru"
+		return u.String()
+	}
+	return raw
+}
+
+// browserUserAgent is a real, currently-plausible desktop Firefox
+// fingerprint. Ported from openflux-server after Yandex's own bot
+// detection reportedly got more aggressive: a CAPTCHA page in place of the
+// real client-config, especially from VPS/hosting IP ranges. A convincing
+// header set can't fix IP-reputation-based challenges, but a request that
+// sets only User-Agent (and a bare "Mozilla/5.0" at that) isn't a shape any
+// real browser produces - that mismatch alone is a signal detection can key
+// off before IP reputation even enters into it.
+const browserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0"
+
+// applyBrowserGetHeaders sets the header set a real Firefox top-level page
+// load carries, not just User-Agent. Deliberately doesn't set
+// Accept-Encoding (would disable transport.NewHTTPClient's transparent
+// response decompression without us then decompressing by hand) or
+// Sec-Ch-Ua/Sec-Ch-Ua-Platform/Sec-Ch-Ua-Mobile (Chromium-only client
+// hints - a Firefox UA sending them would be a bigger tell than sending
+// neither).
+func applyBrowserGetHeaders(h http.Header) {
+	h.Set("User-Agent", browserUserAgent)
+	h.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+	h.Set("Accept-Language", "ru-RU,ru;q=0.8,en-US;q=0.5,en;q=0.3")
+	h.Set("Upgrade-Insecure-Requests", "1")
+	h.Set("Sec-Fetch-Dest", "document")
+	h.Set("Sec-Fetch-Mode", "navigate")
+	h.Set("Sec-Fetch-Site", "none")
+	h.Set("Sec-Fetch-User", "?1")
 }
 
 func (t *YandexDocsTransport) Start() error {
@@ -154,10 +206,17 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 
 		dialer := transport.NewWSDialer(t.dial, 10*time.Second)
 		headers := http.Header{}
-		headers.Set("User-Agent", "Mozilla/5.0")
+		headers.Set("User-Agent", browserUserAgent)
 		headers.Set("Origin", info.Origin)
 		headers.Set("Cookie", info.CookieStr)
 		headers.Set("Host", info.Host)
+		// A WebSocket upgrade, not a page load - differs from
+		// applyBrowserGetHeaders' document-navigation Sec-Fetch-* values
+		// accordingly (real Firefox sends these for a same-origin WS
+		// connection opened from a page it just loaded).
+		headers.Set("Sec-Fetch-Dest", "websocket")
+		headers.Set("Sec-Fetch-Mode", "websocket")
+		headers.Set("Sec-Fetch-Site", "same-origin")
 
 		conn, _, err := dialer.Dial(info.WsURL, headers)
 		if err != nil {
@@ -434,7 +493,7 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 	client := transport.NewHTTPClient(t.dial, 30*time.Second)
 
 	req, _ := http.NewRequest("GET", url, nil)
-	req.Header.Set("User-Agent", "Mozilla/5.0")
+	applyBrowserGetHeaders(req.Header)
 	resp, err := client.Do(req)
 	if err != nil {
 		return YandexDocsInfo{}, err
@@ -444,6 +503,8 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 	htmlBytes, _ := io.ReadAll(resp.Body)
 	html := string(htmlBytes)
 
+	utils.Debugf("[YDOCS] fetchDocInfo GET %s -> %d (%d bytes)", url, resp.StatusCode, len(html))
+
 	var cookies []string
 	for _, c := range resp.Cookies() {
 		cookies = append(cookies, fmt.Sprintf("%s=%s", c.Name, c.Value))
@@ -452,6 +513,18 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 	re := regexp.MustCompile(`<script[^>]*id="client-config"[^>]*>(.*?)</script>`)
 	matches := re.FindStringSubmatch(html)
 	if len(matches) < 2 {
+		// Without this, "config not found" was a dead end - no way to tell
+		// a CAPTCHA page apart from a login redirect or something else
+		// without reproducing it by hand.
+		lower := strings.ToLower(html)
+		if strings.Contains(lower, "captcha") {
+			utils.Debugf("[YDOCS] response looks like a CAPTCHA/bot-check page, not the doc editor")
+		}
+		preview := html
+		if len(preview) > 2000 {
+			preview = preview[:2000]
+		}
+		utils.Debugf("[YDOCS] HTML preview: %s", preview)
 		return YandexDocsInfo{}, fmt.Errorf("config not found")
 	}
 
