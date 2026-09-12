@@ -2,6 +2,9 @@
 examples/*/dist/
 examples/*/dist-archive/
 examples/*/dist-release/
+# --package writes its author archive at the repo root, not under
+# examples/*/ - separate pattern needed for that one.
+/dist-archive/
 
 # Canon files build.py injects into cmd/helper before building and removes
 # after (see README's "Каноны shared/ - что инжектируется и когда") - if a
