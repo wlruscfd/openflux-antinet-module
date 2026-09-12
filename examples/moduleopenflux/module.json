@@ -1,0 +1,53 @@
+{
+  "apiVersion": 1,
+  "schemes": [
+    "openflux"
+  ],
+  "name": "OpenFlux",
+  "description": "TCP-туннель поверх мессенджеров: трафик уходит сообщениями курсора Яндекс.Документов либо сигнальным каналом звонка MAX. Транспорт выбирается ссылкой. Требуется свой exit-node OpenFlux.",
+  "homepage": "https://github.com/p1neappleXpress/OpenFlux",
+  "updateUrl": "",
+  "version": "1.0.0",
+  "license": "GPL-3.0-or-later",
+  "handoverMode": "restart",
+  "parallelPing": false,
+  "pingTimeoutSec": 60,
+  "socks5": true,
+  "dnsResolver": true,
+  "settings": [
+    {
+      "key": "dialTimeoutSec",
+      "type": "int",
+      "label": "Таймаут дозвона до цели (сек)",
+      "default": 15,
+      "min": 1,
+      "max": 120,
+      "description": "Сколько ждать соединения ВНУТРИ туннеля, прежде чем отказать. Путь идёт через мессенджер и задержка скачет сильнее, чем у прямых протоколов, поэтому дефолт выше обычного."
+    },
+    {
+      "key": "keepAliveSec",
+      "type": "int",
+      "label": "Период keep-alive (сек)",
+      "default": 10,
+      "min": 1,
+      "max": 120,
+      "description": "Как часто слать пустое сообщение, чтобы канал мессенджера не закрыли по простою. Реже — меньше следов, но выше риск обрыва."
+    },
+    {
+      "key": "debugLog",
+      "type": "bool",
+      "label": "Подробный лог",
+      "default": false,
+      "description": "Построчная диагностика транспорта и туннеля в журнале модуля. Аналог -debug у оригинального клиента. Обычно не нужен."
+    }
+  ],
+  "helperBinary": {
+    "android": "libopenfluxhelper.so",
+    "desktop": "openflux-helper"
+  },
+  "build": {
+    "goDir": "native/openflux",
+    "goPkg": "./cmd/helper",
+    "ldflags": "-checklinkname=0"
+  }
+}

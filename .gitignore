@@ -1,0 +1,19 @@
+# Build output (build.py) - regenerated, not source.
+examples/*/dist/
+examples/*/dist-archive/
+examples/*/dist-release/
+
+# Canon files build.py injects into cmd/helper before building and removes
+# after (see README's "Каноны shared/ - что инжектируется и когда") - if a
+# build is interrupted mid-way these can survive; they're copies of files
+# already tracked under shared/, not source of their own.
+examples/*/native/*/cmd/helper/offtun_*.go
+examples/*/native/*/cmd/helper/protect_*.go
+examples/*/native/*/cmd/helper/lifecycle_*.go
+examples/*/native/*/cmd/helper/hostproto*.go
+examples/*/native/*/cmd/helper/entry_*.go
+examples/*/native/*/cmd/helper/socks5shared*.go
+examples/*/native/*/cmd/helper/dns_*.go
+
+__pycache__/
+*.pyc
