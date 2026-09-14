@@ -7,7 +7,7 @@
 |---|---|---|
 | `dieWithParent()` | `unix.Prctl(PR_SET_PDEATHSIG, SIGKILL)` — но родитель слот-процесса zygote, он не умирает: вызов безвреден и орфана НЕ ловит; реальная защита на Android — самореап слота в `ModuleHostService.onDestroy` | **linux**: тот же `PR_SET_PDEATHSIG` — helper форкнутый ребёнок бэкенда, сигнал приходит в момент смерти родителя. **windows/darwin**: no-op, аналога нет → сироту ловит только стартовый свип хоста `CleanupOrphanHelpers` |
 | `protectFromOomKill()` | `/proc/self/oom_score_adj = -1000`, defense-in-depth к хостовому `BIND_IMPORTANT` | no-op: модели LMK/vendor-killer нет |
-| `startHostEventReader()` | no-op: модуль — библиотека в слот-процессе, хост зовёт `antinet_module_event` (экспорт канона `shared/entry`) | построчный `stdin` → `handleHostEvent` (канон `shared/hostproto`): ЕДИНСТВЕННЫЙ канал событий хоста (`handover`, `ACTION_RESULT\|…`) |
+| `startHostEventReader()` | no-op: модуль — библиотека в слот-процессе, хост зовёт `antinet_module_event` (экспорт канона `shared/entry`) | построчный `stdin` → `handleHostEvent` (канон `shared/hostproto`): ЕДИНСТВЕННЫЙ канал событий хоста (причина сетевого события — `handover`/`netlost`/`netback`/`stall` по `hostEvents` §2.8, плюс `stop` и `ACTION_RESULT\|…`) |
 | `writeReady(dir, port)` | маркер готовности `ready` + `socks.port`, атомарно (`.tmp` → rename); ошибка записи `ready` возвращается вызывающему | то же самое |
 
 ⛔ **Обработчик `SIGUSR1` не заводи.** Сигналов не шлёт ни один хост: на Android доставка в

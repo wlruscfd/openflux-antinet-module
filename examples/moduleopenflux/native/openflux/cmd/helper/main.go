@@ -97,7 +97,7 @@ var ofStringsRU = ofStrings{
 	socksListenFailedFmt:    "OpenFlux: не удалось взять SOCKS-листенер: %v",
 	writeReadyFailedFmt:     "OpenFlux: не удалось записать маркер готовности: %v — выходим, чтобы хост перезапустил",
 	socksUpFmt:              "OpenFlux: SOCKS5 поднят на 127.0.0.1:%d",
-	handoverLog:             "хендовер: сменилась сеть по умолчанию — хост перезапустит модуль",
+	handoverLog:             "хендовер: сменилась сеть — переподключаю транспорт",
 }
 
 var ofStringsEN = ofStrings{
@@ -108,7 +108,7 @@ var ofStringsEN = ofStrings{
 	socksListenFailedFmt:    "OpenFlux: SOCKS listener failed: %v",
 	writeReadyFailedFmt:     "OpenFlux: failed to mark readiness: %v - exiting so the host can restart",
 	socksUpFmt:              "OpenFlux: SOCKS5 up on 127.0.0.1:%d",
-	handoverLog:             "handover: default network changed, the host will restart this module",
+	handoverLog:             "handover: network changed, reconnecting transport",
 }
 
 // ofStringsFor — APP_LANG "ru" → русский стол, всё остальное (в т.ч. пусто/неизвестно) → английский.
@@ -355,24 +355,37 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	dialTimeout := settingDuration(cfg, "SETTING_dialTimeoutSec", defaultDialSec)
 	keepAlive := settingDuration(cfg, "SETTING_keepAliveSec", defaultKeepSec)
 
-	// Резолвер СВОИХ dial-целей — канон shared/dns: protected off-tunnel, TTL-кэш, single-flight.
-	// Через него идут и адреса транспорта (хост документа / сигнальный MAX), и домены, приходящие
-	// в SOCKS5 CONNECT: туннель OpenFlux несёт ТОЛЬКО TCP (см. ниже), резолвить внутри него нечего.
+	// Резолвер SOCKS5 CONNECT-таргетов — канон shared/dns: protected off-tunnel, TTL-кэш,
+	// single-flight. Домены, приходящие в SOCKS5 CONNECT, резолвятся ИМ: туннель OpenFlux несёт
+	// ТОЛЬКО TCP (см. ниже), резолвить внутри него нечего.
 	resolver := newProtectedResolver(cfg["DNS_SERVERS"], protectPath)
+
+	// Дозвон и резолв САМОГО транспорта (документ Яндекса / сигнальный хост MAX) — глобально,
+	// package-level (transport/protect.go, дословная копия openflux-server): вендорный код внутри
+	// yandex.go/oneme больше не принимает dial параметром конструктора, а зовёт
+	// transport.ProtectedDialer()/ProtectedResolver() сам. protectFdFunc — канон shared/protect.
+	transport.SetProtector(func(fd int) bool { return protectFdFunc(protectPath)(int32(fd)) })
+	if servers := hostDNSServers(cfg["DNS_SERVERS"]); len(servers) > 0 {
+		transport.SetBootstrapDNSServers(servers)
+	}
+	net.DefaultResolver = transport.ProtectedResolver()
 
 	tcfg := transport.DefaultConfig()
 	if keepAlive > 0 {
 		tcfg.KeepAliveInterval = keepAlive
 	}
-	// Дозвон транспорта — через protect/off-TUN + тот же резолвер (см. transport/dial.go).
-	dial := protectedDialContext(resolver, protectPath)
 
 	var trans transport.Transport
+	var hoTransport handoverer
 	switch link.Transport {
 	case transportYandex:
-		trans = transport.NewCompressedTransport(yandex.NewYandexDocsTransport(link.URL, tcfg, dial))
+		yt := yandex.NewYandexDocsTransport(link.URL, tcfg)
+		trans = transport.NewCompressedTransport(yt)
+		hoTransport = yt
 	default:
-		trans = transport.NewCompressedTransport(oneme.NewOneMeTransport(false, link.Token, link.UID, tcfg, dial))
+		ot := oneme.NewOneMeTransport(false, link.Token, link.UID, tcfg)
+		trans = transport.NewCompressedTransport(ot)
+		hoTransport = ot
 	}
 
 	emitProgress(s.openingTransportFmt, link.Transport)
@@ -413,12 +426,16 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	emitStatus(statusOK, "")
 	log.Printf("openflux helper: SOCKS5 on 127.0.0.1:%d transport=%s", actualPort, link.Transport)
 
-	// Хендовер: дескриптор объявляет `handoverMode: "restart"`, то есть хост на смене сети убивает
-	// и поднимает helper заново. Обработчик всё равно есть — по контракту событие подтверждается
-	// (EVENT_ACK эмитит канон), а строка в постоянном логе объясняет юзеру разрыв.
+	// Хендовер: дескриптор объявляет `handoverMode: "signal"` + `hostEvents` (все четыре причины,
+	// §2.8) — хост НЕ убивает helper на смене сети, а шлёт событие в живой процесс. Реакция —
+	// оборвать живую сессию транспорта и ничего больше: read-петля/keepalive транспорта уже умеют
+	// переподключаться сами (yandex.(*YandexDocsTransport).Handover / oneme.(*OneMeTransport).Handover),
+	// а SOCKS5-листенер и уже принятые соединения переживают паузу вместо полного перезапуска модуля.
 	setHostEventHandler(func(event string) {
-		if event == "handover" {
+		switch event {
+		case "handover", "netlost", "netback", "stall":
 			emitLog(s.handoverLog)
+			hoTransport.Handover()
 		}
 	})
 
@@ -526,37 +543,21 @@ func resolveV4(req socksRequest, resolver *protectedResolver) (string, error) {
 	return "", fmt.Errorf("no IPv%d address for %s (got %v)", dnsQueryFamilyV4, req.Host, ips)
 }
 
-// protectedDialContext — чем транспорты дозваниваются наружу (см. transport/dial.go): резолв тем
-// же protected-резолвером + protect/off-TUN на самом сокете. Явная функция с параметрами, а не
-// package-level var: заполняемую отдельным init() переменную легко забыть заполнить, и тогда
-// сборка чиста, а рантайм падает на первом же обращении (MODULE_API §4, живой прецедент).
-func protectedDialContext(resolver *protectedResolver, protectPath string) transport.DialContextFunc {
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		host, portStr, err := net.SplitHostPort(addr)
-		if err != nil {
-			return nil, err
+// handoverer — реакция на событие хоста (§2.8), реализована и yandex.YandexDocsTransport, и
+// oneme.OneMeTransport. Отдельный локальный интерфейс, а не метод на `transport.Transport`: тот
+// живёт в transport.go, который обязан оставаться дословной копией openflux-server (см. этого
+// файла шапку и examples/moduleopenflux/README.md) — добавлять в него что-то модульное нельзя.
+type handoverer interface{ Handover() }
+
+// hostDNSServers — DNS_SERVERS (те же bare-IP/ip:port через запятую, что читает shared/dns) для
+// transport.SetBootstrapDNSServers: транспорт резолвит СВОИ хосты (docs.yandex.ru и т.п.) через
+// физические DNS хоста, а не через захардкоженные публичные резолверы transport/protect.go.
+func hostDNSServers(csv string) []string {
+	var out []string
+	for _, s := range strings.Split(csv, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
 		}
-		ips := []string{host}
-		if net.ParseIP(host) == nil {
-			ips, err = resolver.LookupHost(host)
-			if err != nil {
-				return nil, fmt.Errorf("resolve %s: %w", host, err)
-			}
-		}
-		var pst protectStat
-		d := net.Dialer{Control: dialControl(protectPath, &pst)}
-		var lastErr error
-		for _, ip := range ips {
-			conn, derr := d.DialContext(ctx, network, net.JoinHostPort(ip, portStr))
-			if derr == nil {
-				return conn, nil
-			}
-			lastErr = derr
-		}
-		if lastErr == nil {
-			lastErr = fmt.Errorf("no address for %s", host)
-		}
-		return nil, fmt.Errorf("dial %s (protectElapsed=%.3fms protectTries=%d protectErr=%q): %w",
-			addr, pst.elapsedMs, pst.attempts, pst.firstErr, lastErr)
 	}
+	return out
 }

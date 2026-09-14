@@ -1,6 +1,8 @@
 package oneme
 
 import (
+	"fmt"
+
 	"universal-bypass-tool/transport"
 	"universal-bypass-tool/utils"
 )
@@ -13,9 +15,6 @@ type OneMeTransport struct {
 
 	oneMeClient MaxClient
 	ch          *CallHandler
-
-	// dial — чем дозваниваются оба WebSocket'а этого транспорта. См. transport/dial.go.
-	dial transport.DialContextFunc
 }
 
 func (t *OneMeTransport) Receive(callback func([]byte)) {
@@ -26,34 +25,44 @@ func (t *OneMeTransport) Stats() transport.TransportStats {
 	return t.b.Stats()
 }
 
-func NewOneMeTransport(isExit bool, maxToken string, maxUid int64, config transport.TransportConfig, dial transport.DialContextFunc) *OneMeTransport {
+func (t *OneMeTransport) SetEventCallback(fn func(code, detail string)) {
+	t.b.SetEventCallback(fn)
+}
+
+func NewOneMeTransport(isExit bool, maxToken string, maxUid int64, config transport.TransportConfig) *OneMeTransport {
 	return &OneMeTransport{
 		b:     transport.NewBaseTransport(config),
 		token: maxToken,
 		uid:   maxUid,
 		exit:  isExit,
-		dial:  dial,
 	}
 }
 
 func (t *OneMeTransport) Start() error {
+	t.b.EmitEvent(transport.EventConnecting, "1")
+
 	utils.Debugf("creating max client ...")
-	t.oneMeClient = *NewMaxClient(t.dial)
-	t.oneMeClient.Connect()
-	t.oneMeClient.LoginByToken(t.token)
+	t.oneMeClient = *NewMaxClient()
+	if err := t.oneMeClient.Connect(); err != nil {
+		return fmt.Errorf("max: connect: %w", err)
+	}
+	if err := t.oneMeClient.LoginByToken(t.token); err != nil {
+		return fmt.Errorf("max: login: %w", err)
+	}
 
 	if t.exit {
 		utils.Debugf("configured ch for exit node")
-		t.ch = startIncomingListener(&t.oneMeClient, t.dial)
+		t.ch = startIncomingListener(&t.oneMeClient)
 	} else {
 		utils.Debugf("configured ch for client mode")
-		t.ch = startOutgoingCall(&t.oneMeClient, t.uid, t.dial)
+		t.ch = startOutgoingCall(&t.oneMeClient, t.uid)
 	}
 
 	utils.Debugf("configured dc inbound")
 	t.ch.dcInbound = func(data []byte) {
 		t.b.CallReceive(data)
 	}
+	t.b.EmitEvent(transport.EventConnected, "1")
 
 	return t.b.Start()
 }

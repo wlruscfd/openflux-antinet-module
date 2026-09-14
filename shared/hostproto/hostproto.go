@@ -214,13 +214,20 @@ func emitEventAck(event string) {
 
 var hostEventHandler func(string)
 
-// setHostEventHandler — реакция МОДУЛЯ на событие хоста (сейчас единственное — "handover").
-// Канон отвечает за транспорт и за EVENT_ACK; что делать с событием, решает модуль.
+// setHostEventHandler — реакция МОДУЛЯ на событие хоста. Канон отвечает за транспорт и за
+// EVENT_ACK; что делать с событием, решает модуль.
+//
+// Причины сетевого события (MODULE_API §2.8): `handover` (сеть сменилась), `netlost` (сети нет),
+// `netback` (сеть вернулась), `stall` (сеть та же, проба хоста через модуль не прошла). Хост шлёт
+// только те, что модуль объявил в `hostEvents`: необъявленный `stall` приедет как `handover`,
+// необъявленные `netlost`/`netback` не приедут вовсе — поэтому обработчик может разбирать строку
+// без ветки «а вдруг что-то незнакомое».
 func setHostEventHandler(h func(string)) { hostEventHandler = h }
 
 // handleHostEvent — ЕДИНАЯ точка входа событий хоста: desktop — строка stdin (канон
 // shared/lifecycle::startHostEventReader), Android-слот — прямой C-ABI-вызов antinet_module_event
-// (канон shared/entry). Форматы: `handover` и `ACTION_RESULT|<id>|<payload>`.
+// (канон shared/entry). Форматы: причина сетевого события (см. setHostEventHandler), `stop`
+// (§2.8) и `ACTION_RESULT|<id>|<payload>`.
 //
 // EVENT_ACK печатается ПЕРВЫМ делом — подтверждаем ПОЛУЧЕНИЕ, а не завершение реакции: реакция
 // бывает долгой (сброс пулов резолверов, переустановка сессии), а хост ждёт подтверждения секунды.

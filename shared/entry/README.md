@@ -31,7 +31,7 @@ func moduleCall(verb, arg string) string
 | Экспорт | Что делает |
 |---|---|
 | `antinet_module_run(configContent, resolversPath, profileDir, protectPath, listenFd)` | единственная обязательная точка входа (§2.3) → `realMain`. Конфиг приезжает СОДЕРЖИМЫМ, не путём; `listenFd` — готовый слушающий сокет, которым владеет хост (§2.6) |
-| `antinet_module_event(event)` | событие хоста (§2.8) → `handleHostEvent` (канон `shared/hostproto`) |
+| `antinet_module_event(event)` | событие хоста с ПРИЧИНОЙ (§2.8: `handover`/`netlost`/`netback`/`stall`, плюс `stop`/`ACTION_RESULT\|…`) → `handleHostEvent` (канон `shared/hostproto`) |
 | `antinet_module_call(verb, arg)` | parse-only сабкоманды → `moduleCall`. Возврат — malloc'нутая C-строка |
 | `antinet_module_free(p)` | парная освобождалка: память malloc'ена рантаймом ЭТОЙ `.so`, освобождать её обязан тот же аллокатор |
 

@@ -7,8 +7,6 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-
-	"universal-bypass-tool/transport"
 )
 
 const (
@@ -17,11 +15,10 @@ const (
 	USER_AGENT  = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
 )
 
-func NewMaxClient(dial transport.DialContextFunc) *MaxClient {
+func NewMaxClient() *MaxClient {
 	return &MaxClient{
 		deviceID:      genUUID(),
 		keepaliveStop: make(chan struct{}),
-		dial:          dial,
 	}
 }
 
@@ -31,7 +28,7 @@ func (c *MaxClient) Connect() error {
 	header := http.Header{}
 	header.Set("Origin", "https://web.max.ru")
 	header.Set("User-Agent", USER_AGENT)
-	conn, _, err := transport.NewWSDialer(c.dial, 10*time.Second).Dial(WS_HOST, header)
+	conn, _, err := protectedWSDialer().Dial(WS_HOST, header)
 	if err != nil {
 		return err
 	}
@@ -44,6 +41,14 @@ func (c *MaxClient) Connect() error {
 func (c *MaxClient) SetEventCallback(cb func(MaxPacket)) { c.onEvent = cb }
 
 func (c *MaxClient) readLoop() {
+	// See CallHandler.readLoop's doc comment: an unrecovered panic here
+	// kills the whole exit-node process, every other key's transport
+	// included.
+	defer func() {
+		if r := recover(); r != nil {
+			logError("recovered in MaxClient.readLoop: %v", r)
+		}
+	}()
 	for {
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
@@ -149,6 +154,11 @@ func (c *MaxClient) getUserMap(resp *MaxPacket) map[int64]UserInfo {
 }
 
 func (c *MaxClient) keepalive() {
+	defer func() {
+		if r := recover(); r != nil {
+			logError("recovered in MaxClient.keepalive: %v", r)
+		}
+	}()
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {

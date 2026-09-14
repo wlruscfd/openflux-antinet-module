@@ -4,14 +4,11 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v3"
-
-	"universal-bypass-tool/transport"
 )
 
 var (
@@ -32,6 +29,16 @@ func (h *CallHandler) Send(data []byte) {
 }
 
 func (h *CallHandler) readLoop() {
+	// This exit-node process serves many keys at once - an unrecovered
+	// panic in any one goroutine kills the whole process, taking every
+	// other key's transport down with it (the same reasoning as
+	// signalReconnect's doc comment, one goroutine's crash isolated from
+	// process-wide).
+	defer func() {
+		if r := recover(); r != nil {
+			logError("recovered in CallHandler.readLoop: %v", r)
+		}
+	}()
 	logInfo("[%s] Signaling connected", h.tag)
 	for {
 		_, message, err := h.conn.ReadMessage()
@@ -85,8 +92,16 @@ func (h *CallHandler) signalReconnect() {
 		default:
 		}
 	} else {
-		logError("[%s] Receiver connection died, exiting", h.tag)
-		os.Exit(1)
+		// This exit-node process can be serving many keys at once (see
+		// nodeagent.Orchestrator) - one MAX key's signaling connection
+		// dying is that key's problem, not every other key's. os.Exit(1)
+		// here used to kill the whole process (every other key's yandex/
+		// volga/max worker included) over a single dropped connection;
+		// there's no auto-reconnect for this role yet (matching upstream,
+		// which sends the same signal into a reconnectCh nothing ever
+		// listens on for this role either), but failing this one call
+		// handler quietly beats taking every other key down with it.
+		logError("[%s] Receiver connection died - this call is over, other keys are unaffected", h.tag)
 	}
 }
 
@@ -331,8 +346,8 @@ func (h *CallHandler) handleSDP(sdpType string, sdpStr string) {
 	}
 }
 
-func startOutgoingCall(client *MaxClient, calleeID int64, dial transport.DialContextFunc) *CallHandler {
-	h := &CallHandler{tag: "CALLER", role: "caller", dial: dial}
+func startOutgoingCall(client *MaxClient, calleeID int64) *CallHandler {
+	h := &CallHandler{tag: "CALLER", role: "caller"}
 	h.seq = 1
 	h.reconnectCh = make(chan struct{}, 1)
 	h.msgHandler = func(text string) {
@@ -436,7 +451,7 @@ func startOutgoingCall(client *MaxClient, calleeID int64, dial transport.DialCon
 			json.Unmarshal([]byte(paramsStr), &params)
 
 			endpoint := params.Endpoint + "&platform=WEB&appVersion=1.1&version=5&device=browser&capabilities=2A03F&clientType=ONE_ME&tgt=start"
-			conn, _, err := transport.NewWSDialer(h.dial, 10*time.Second).Dial(endpoint, nil)
+			conn, _, err := protectedWSDialer().Dial(endpoint, nil)
 			if err != nil {
 				logError("[CALLER] Dial error: %v, retrying...", err)
 				time.Sleep(1 * time.Second)
@@ -457,8 +472,8 @@ func startOutgoingCall(client *MaxClient, calleeID int64, dial transport.DialCon
 	return h
 }
 
-func startIncomingListener(client *MaxClient, dial transport.DialContextFunc) *CallHandler {
-	h := &CallHandler{tag: "RECEIVER", role: "receiver", dial: dial}
+func startIncomingListener(client *MaxClient) *CallHandler {
+	h := &CallHandler{tag: "RECEIVER", role: "receiver"}
 	h.seq = 1
 	h.msgHandler = func(text string) {
 		var data map[string]interface{}
@@ -524,7 +539,7 @@ func startIncomingListener(client *MaxClient, dial transport.DialContextFunc) *C
 			endpoint := craftEndpoint(convID, callDetails)
 			logInfo("[RECEIVER] Initial endpoint: %s", endpoint)
 
-			conn, _, err := transport.NewWSDialer(h.dial, 10*time.Second).Dial(endpoint, nil)
+			conn, _, err := protectedWSDialer().Dial(endpoint, nil)
 			if err != nil {
 				logError("[RECEIVER] Connect error: %v", err)
 				return

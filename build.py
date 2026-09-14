@@ -130,11 +130,30 @@ MODULES = load_modules()
 # модуль не требует искать разбросанные сравнения.
 DOCS_REFERENCE_MODULE = "echo"
 
+def android_abi_list():
+    """Канонический список Android-ABI — ЧИТАЕТСЯ из `tools/build-module.py` (`ABI_MAP`), а не
+    дублируется здесь: второй список разойдётся с первым на первом же новом ABI."""
+    import importlib.util
+    src = HERE / "tools" / "build-module.py"
+    spec = importlib.util.spec_from_file_location("_antinet_build_module", src)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return list(m.ABI_MAP.keys())
 
-def _flat_descriptor_base(d):
+
+def _flat_descriptor_base(d, bundle_target):
     """Общие top-level поля дескриптора для ЛЮБОГО dist-манифеста (android/desktop) — единая база,
     чтобы копии не разъезжались при будущей правке. Caller добавляет свой backend-специфичный
-    helperBinary поверх (+ легаси-actionBinary, если модуль его объявил)."""
+    helperBinary поверх (+ легаси-actionBinary, если модуль его объявил).
+
+    `bundle_target` — АРХИТЕКТУРА ИМЕННО ЭТОГО бандла: `arm64-v8a` для Android, `linux_amd64` для
+    Desktop. Значение совпадает с ключом, под которым бандл лежит в манифесте обновления (§2.5), —
+    имя одно и то же намеренно, чтобы автору было нечего сопоставлять в уме.
+    ⚠ Это ПОДПИСЬ, а не пропуск: хост принимает решение «эта библиотека у нас не загрузится» по
+    самому артефакту (ELF-заголовок / PE / Mach-O), а не по этому полю. Поле нужно двум другим:
+    сборщику — поймать при публикации бандл, положенный не под тот ключ манифеста; хосту — сказать
+    юзеру, ЧТО именно он принёс («бандл под arm64-v8a, устройство armeabi-v7a») вместо общей
+    ошибки. Заявление автора и свойство файла могут разойтись, и тогда прав файл."""
     flat = {
         "apiVersion": d.get("apiVersion", 1),
         "schemes": d["schemes"],
@@ -148,6 +167,10 @@ def _flat_descriptor_base(d):
         # безопасны, а вот выдержит ли две сессии протокол/сервер — решает автор модуля.
         "pingWhileConnected": d.get("pingWhileConnected", False),
         "handoverMode": d.get("handoverMode", "restart"),
+        # Причины события хоста, которые модуль РАЗБИРАЕТ (§2.8). Не объявил → хост шлёт ему
+        # только `handover`, подменяя им любую другую причину: поведение ровно как до появления
+        # причин. Пустой список в дескриптор не пишем — отсутствие ключа и есть «только handover».
+        **({"hostEvents": d["hostEvents"]} if d.get("hostEvents") else {}),
         "relayWindowSec": d.get("relayWindowSec", 0),
         # Версия ПОСТАВКИ + куда ходить за обновлением. Оба обязаны доехать до установленного
         # модуля: без `version` хосту не с чем сравнивать манифест (любая версия выглядит новее),
@@ -159,6 +182,7 @@ def _flat_descriptor_base(d):
         # (`ModuleManager.kt::installedModules` J_VERSION → compareModuleVersions,
         #  `modulemanager.pas::ParseModuleJson` 'version' → CompareModuleVersions).
         "version": str(d.get("version", "")).strip(),
+        "bundleTarget": bundle_target,
     }
     if d.get("updateUrl"):
         flat["updateUrl"] = d["updateUrl"]
@@ -189,12 +213,12 @@ def _flat_descriptor_base(d):
     return flat
 
 
-def emit_desktop_descriptor(mod, goos, out_dir):
+def emit_desktop_descriptor(mod, goos, goarch, out_dir):
     """Кладёт рядом с desktop-бинарём module.json (плоский) — его читает Desktop-хост (discovery).
     helperBinary = имя desktop-бинаря (+.exe на windows); остальные ключи — из дескриптора."""
     d = MODULES[mod]["descriptor"]
     ext = ".exe" if goos == "windows" else ""
-    flat = _flat_descriptor_base(d)
+    flat = _flat_descriptor_base(d, f"{goos}_{goarch}")
     flat["helperBinary"] = d["helperBinary"]["desktop"] + ext
     # actionBinary (UI-действие §2.7) — имя бинаря (+.exe на windows); modulemanager.ParseModuleJson читает.
     ab = MODULES[mod].get("actbin")
@@ -204,7 +228,7 @@ def emit_desktop_descriptor(mod, goos, out_dir):
         json.dumps(flat, ensure_ascii=False, separators=(",", ":")) + "\n", encoding="utf-8")
 
 
-def emit_android_descriptor(mod, out_dir):
+def emit_android_descriptor(mod, abi, out_dir):
     """Кладёт рядом с `.so` module.json (плоский) — его читает Android-хост (`ModuleManager.discover`
     сканирует `files/modules/<id>/`). Симметрично emit_desktop_descriptor: одна и та же плоская схема,
     отличается только backend-специфичный helperBinary.
@@ -213,7 +237,7 @@ def emit_android_descriptor(mod, out_dir):
     `dist/android/<abi>/` нёс голую `.so` без единого описания. Теперь ABI-каталог самодостаточен —
     ровно то, что распаковывается в `files/modules/<id>/` на устройстве."""
     d = MODULES[mod]["descriptor"]
-    flat = _flat_descriptor_base(d)
+    flat = _flat_descriptor_base(d, abi)
     # Object form, NOT a flat string. Плоская строка на Desktop-стороне однозначно означает
     # «имя desktop-бинаря», и Android-читатель её попросту не разбирает: `ModuleManager.kt`'s
     # discover() делает `optJSONObject("helperBinary")?.optString("android")` — на строке это молча
@@ -543,7 +567,7 @@ def build_desktop(go, mod, goos, goarch):
                     err(f"[{mod}] actionBinary build упал (код {ar.returncode}) — UI-действие не заработает")
                 else:
                     ok(f"[{mod}] actionBinary → {about}  ({about.stat().st_size if about.exists() else 0} байт)")
-    emit_desktop_descriptor(mod, goos, out.parent)   # module.json рядом с бинарём (Desktop discovery)
+    emit_desktop_descriptor(mod, goos, goarch, out.parent)   # module.json рядом с бинарём (Desktop discovery)
     # per-OS installer-скрипт модуля (распространяемый; кладёт файлы + ставит нативные prereq UI-действия:
     # Windows WebView2 / Linux webkit2gtk — §2.7). Источник в корне модуля (трекается), копируем в бандл.
     inst = {"windows": "install-windows.ps1", "linux": "install-linux.sh", "darwin": "install-darwin.sh"}.get(goos)
@@ -596,7 +620,7 @@ def build_android(mod, abis, api):
         # это мёртвый груз, а каталог целиком уезжает в бандл — убираем сразу.
         for stale in abi_dir.glob("*.h"):
             stale.unlink()
-        emit_android_descriptor(mod, abi_dir)
+        emit_android_descriptor(mod, abi_dir.name, abi_dir)
     return True
 
 
@@ -714,21 +738,31 @@ python build.py --module __MOD__ --os android --abis arm64-v8a,armeabi-v7a,x86_6
 protect-fd сокетов, сабкоманды `summarize`/`normalize` (контракт — `MODULE_API.md` §2.3).
 
 ## 3. Публикация (чтобы AntiNet ставил по `antinet://`-ссылке и авто-обновлял)
-1. Собери релиз-артефакты:
+1. **СНАЧАЛА дескриптор, потом сборка.** В `module.json`: `updateUrl` = адрес, по которому БУДЕТ
+   лежать манифест, и поднятая `version`. Порядок именно такой, потому что `module.json` едет ВНУТРИ
+   каждого бандла: адрес, вписанный после сборки, до пользователей не доедет — у них не будет ни
+   авто-проверки, ни рабочего «Поделиться модулем» (ссылка уйдёт без `m`, и получателю ставить
+   неоткуда). Правишь `updateUrl` позже — пересобирай и ПЕРЕЗАЛИВАЙ бандлы.
+   ⚠ Адрес манифеста обязан быть СТАБИЛЬНЫМ (файл на ветке, напр.
+   `raw.githubusercontent.com/<owner>/<repo>/main/antinet-module.json`), его перезаписывают на каждый
+   релиз. Release-ассет для манифеста не годится: у каждого релиза он свой, и запечённый в дескриптор
+   адрес навсегда останется на старой версии. Сами ZIP'ы, наоборот, могут переезжать свободно.
+2. Собери релиз-артефакты:
    ```
    python build.py --module __MOD__ --os all      # helper'ы под все цели → dist/
    python build.py --bundle --module __MOD__      # → dist-release/*.zip + antinet-module.json
    ```
-2. Залей на хостинг (напр. GitHub Releases) каждый `dist-release/*.zip`.
-3. Открой `dist-release/antinet-module.json`, впиши реальные URL'ы (`android[<abi>]` +
-   `desktop[<os>_<arch>]`), залей этот JSON (raw-ссылка).
-4. Пропиши в `module.json` → `updateUrl` = raw-URL манифеста (AntiNet будет авто-проверять и обновлять
-   модуль ТИХО, без подтверждений и установщиков — на обеих платформах).
-5. На КАЖДЫЙ релиз поднимай `version` в `module.json` (иначе авто-проверка не увидит обновление).
+3. Залей на хостинг (напр. GitHub Releases) каждый `dist-release/*.zip`.
+4. Открой `dist-release/antinet-module.json`, впиши реальные URL'ы бандлов (`android[<abi>]` +
+   `desktop[<os>_<arch>]` — ВСЕ, что собрал: манифест без бандла под ABI устройства эта платформа
+   отвергает целиком) и залей его по адресу из шага 1.
+5. Следующий релиз — снова с шага 1: без поднятой `version` авто-проверка обновления не увидит.
    Сравнение посегментно-числовое, так что «1.3.10» корректно новее «1.3.7».
-6. Распространяй install-ссылку (один тап «скачать+поставить»):
+6. Распространяй install-ссылку (один тап «скачать+поставить») — её собирает сам AntiNet
+   («Настройки → Модули → Поделиться модулем»), руками формат готовить не надо:
    `antinet://import?module=<base64url-no-pad JSON>`, где JSON =
-   `{"s":"__SCHEME__","n":"__NAME__","m":"<updateUrl>","h":"__HOMEPAGE__"}`.
+   `{"s":"__SCHEME__","n":"__NAME__","m":"<updateUrl>","h":"__HOMEPAGE__"}`. Ключ `m` и есть
+   `updateUrl`; без него получатель установить не сможет — диалог лишь предложит открыть `h`.
 
 Полная спецификация публикации/авто-обновления/ссылки — **`MODULE_API.md` §2.5**.
 
@@ -991,11 +1025,19 @@ def cmd_package(mod):
 
     # Образец манифеста авто-обновления — чтобы форма была видна ДО первой сборки. Реальный
     # (с подставленной версией и перечнем собранных таргетов) генерит `--bundle`.
+    #
+    # ⛔ Цели перечисляются по КАНОНИЧЕСКИМ спискам (`android_abi_list()` / `DESKTOP_OSES`), а не
+    # подмножеством из головы. Образец — это форма, которую автор копирует в реальный манифест, а
+    # манифест без бандла под ABI устройства платформа отвергает ЦЕЛИКОМ (MODULE_API §2.5): урезанный
+    # образец тихо оставляет часть устройств без обновления, и узнают об этом они, а не автор. Тот же
+    # инвариант `cmd_bundle` уже держит отказом на неполном наборе ABI — образец обязан ему не
+    # противоречить. Живой случай: сторонний модуль скопировал прежнюю форму (один ABI + две
+    # desktop-цели) при пяти реально выложенных бандлах.
     example_manifest = {
         "version": vname,
-        "android": {"arm64-v8a": f"https://<host>/{mod}-android-arm64-v8a.zip"},
-        "desktop": {"windows_amd64": f"https://<host>/{mod}-windows_amd64.zip",
-                    "linux_amd64": f"https://<host>/{mod}-linux_amd64.zip"},
+        "android": {abi: f"https://<host>/{mod}-android-{abi}.zip" for abi in android_abi_list()},
+        "desktop": {f"{osname}_amd64": f"https://<host>/{mod}-{osname}_amd64.zip"
+                    for osname in DESKTOP_OSES},
         "changelog": "что нового в этой версии",
     }
     (stage / "antinet-module.example.json").write_text(
@@ -1024,6 +1066,29 @@ def _zip_flat(src_dir, zpath):
                 z.write(f, f.name)
 
 
+def _bundle_target_mismatch(bundle_dir, expected):
+    """Проверяет ПОДПИСЬ бандла перед упаковкой: `bundleTarget` в его `module.json` обязан совпасть
+    с ключом, под которым бандл уедет в манифест (`android[<abi>]` / `desktop[<os>_<arch>]`).
+    Возвращает текст расхождения либо None.
+
+    Зачем при публикации, а не только на устройстве: перепутанный бандл ставится молча «успешно» —
+    хост распакует его, не найдёт годного артефакта и откатится, а автор увидит это только в чужом
+    баг-репорте. Здесь же расхождение стоит между сборкой и выкладкой, где ещё дёшево.
+    Проверяется РЯДОМ с упаковкой (а не в `_zip_flat`) намеренно: ожидаемый ключ известен только
+    вызывающему, и отказ обязан отменить ВЕСЬ релиз, а не пропустить один бандл."""
+    jp = bundle_dir / "module.json"
+    try:
+        got = json.loads(jp.read_text(encoding="utf-8")).get("bundleTarget", "")
+    except (OSError, ValueError) as e:
+        return f"{jp} не читается: {e}"
+    if not got:
+        # Старый бандл, собранный до появления поля. Пересборка дешевле догадок о его арке.
+        return f"{jp}: нет bundleTarget — пересобери модуль этим build.py"
+    if got != expected:
+        return f"{jp}: bundleTarget={got}, а бандл кладётся под ключ {expected}"
+    return None
+
+
 def cmd_bundle(mod):
     """Release-артефакты для публикации (§2.5): плоский ZIP каждого собранного `dist/android/<abi>/`
     и `dist/desktop/<os>_<arch>/` + скелет манифеста авто-обновления `antinet-module.json`
@@ -1039,19 +1104,48 @@ def cmd_bundle(mod):
     rel = REPO / m["root"] / "dist-release"
     rel.mkdir(parents=True, exist_ok=True)
 
+    # ⛔ ПОДПИСИ ПРОВЕРЯЮТСЯ ВСЕ ДО ЕДИНОГО ЗИПА. Проверка «по ходу упаковки» оставляла бы
+    # dist-release наполовину записанным: часть архивов новая, часть от прошлого релиза, а автор
+    # видит каталог, который выглядит готовым. Отказ обязан не оставлять следов.
+    to_zip = []   # (каталог, ключ манифеста)
+    if android_root.exists():
+        for abi in android_abi_list():
+            abi_dir = android_root / abi
+            if abi_dir.is_dir() and (abi_dir / m["helper"]).is_file() and (abi_dir / "module.json").is_file():
+                to_zip.append((abi_dir, abi))
+    if desktop_root.exists():
+        to_zip += [(d, d.name) for d in sorted(desktop_root.iterdir()) if d.is_dir()]
+    for bdir, key in to_zip:
+        if bad := _bundle_target_mismatch(bdir, key):
+            err(f"[{mod}] {bad} — релиз не собран, dist-release не тронут"); return False
+
     android_bundles = {}
     if android_root.exists():
-        for abi_dir in sorted(android_root.iterdir()):
-            # ABI-каталог считается собранным только если в нём есть И .so, И дескриптор: голая
-            # библиотека без module.json на устройстве не откроется (discover её не увидит).
+        # ⛔ Идём по КАНОНИЧЕСКОМУ списку ABI, а не по `iterdir()`. Любой посторонний каталог в
+        # `dist/android/` (временный, недособранный, чужой) иначе уезжает в релиз как «ABI» — и в
+        # манифест авто-обновления вписывается ключ, которого у Android не существует.
+        for abi in android_abi_list():
+            abi_dir = android_root / abi
+            # ABI считается собранным только если есть И .so, И дескриптор: голая библиотека без
+            # module.json на устройстве не откроется (discover её не увидит).
             if not abi_dir.is_dir() or not (abi_dir / m["helper"]).is_file() \
                     or not (abi_dir / "module.json").is_file():
                 continue
-            abi = abi_dir.name  # arm64-v8a / armeabi-v7a / x86_64 / x86
             zpath = rel / f"{mod}-android-{abi}.zip"
             _zip_flat(abi_dir, zpath)
             android_bundles[abi] = f"https://<host>/{mod}-android-{abi}.zip"
             ok(f"[{mod}] android-бандл → {zpath.relative_to(REPO)}")
+
+        # ⛔ НЕПОЛНЫЙ НАБОР ABI — ОТКАЗ, а не тихий частичный релиз. Бандлы уходят в
+        # авто-обновление: недостающий ABI значит, что часть устройств получит СТАРУЮ версию
+        # модуля (или не получит ничего), и узнают об этом они, а не мы. Живой случай: собран был
+        # только `arm64-v8a`, а в релиз уехали три бандла с `.so` суточной давности — сборщик
+        # отчитался успехом, потому что честно упаковал то, что нашёл.
+        missing = [x for x in android_abi_list() if x not in android_bundles]
+        if missing:
+            err(f"[{mod}] в dist/android нет ABI: {', '.join(missing)} — бандл был бы неполным.")
+            err(f"  собери их: python build.py --os android --abis all --module {mod}")
+            return False
 
     bundles = {}
     if desktop_root.exists():
@@ -1119,7 +1213,12 @@ def main():
     ap.add_argument("--os", help=f"целевая ОС: {ALL_OSES} | all (android+desktop)")
     ap.add_argument("--module", help=f"модуль: {list(MODULES)}")
     ap.add_argument("--arch", default="amd64", help="GOARCH для desktop (amd64|arm64|386|arm; default amd64)")
-    ap.add_argument("--abis", default="arm64-v8a", help="ABI для android (через запятую; all = все; default arm64-v8a)")
+    # ⛔ Дефолт `None`, а не `arm64-v8a`: он резолвится ПО ЦЕЛИ (см. ниже). При `--os all` человек
+    # просит собрать ВСЁ, и молча получить один ABI из четырёх — ровно та ловушка, из-за которой
+    # в release-бандлы уехали три устаревших `.so`. Явный `--abis` по-прежнему главнее.
+    ap.add_argument("--abis", default=None,
+                    help="ABI для android (через запятую; all = все; default arm64-v8a, "
+                         "а при --os all — все)")
     ap.add_argument("--api", type=int, default=26, help="Android API level для NDK clang (default 26)")
     ap.add_argument("-y", "--yes", action="store_true", help="не задавать вопросов (всё из флагов/дефолтов)")
     ap.add_argument("--doctor", action="store_true",
@@ -1176,17 +1275,25 @@ def main():
     else:
         targets = [target]
 
+    # Резолв ABI ПО ЦЕЛИ (см. доккоммент ключа): явный `--abis` главнее всего; `--os all` значит
+    # «собери всё», то есть и все ABI; одиночная цель сохраняет прежний дешёвый дефолт.
+    abis = a.abis
+    if abis is None:
+        abis = "all" if target == "all" else "arm64-v8a"
+        if target == "all":
+            info("--os all → ABI: все (явный --abis перекрывает)")
+
     # ⚠ Префлайт ДО первой сборки, а не после падения: `go build упал (код 1)` не говорит автору
     # стороннего модуля НИЧЕГО о том, чего не хватает. Здесь же — что именно и команда установки
     # под его хост-ОС. Интерактивный режим оставляет шанс дать путь к go руками (как было раньше).
-    problems = check_toolchain(targets, mod, a.abis, a.api)
+    problems = check_toolchain(targets, mod, abis, a.api)
     if problems:
         go_missing = any("Go" in w for w, _ in problems)
         if go_missing and interactive:
             manual = ask("Путь к go (не найден в PATH; пусто — выйти)")
             if manual and Path(manual).exists():
                 os.environ["PATH"] = str(Path(manual).parent) + os.pathsep + os.environ.get("PATH", "")
-                problems = check_toolchain(targets, mod, a.abis, a.api)
+                problems = check_toolchain(targets, mod, abis, a.api)
         if problems:
             report_toolchain(problems)
             return 2
@@ -1199,7 +1306,7 @@ def main():
     fails = []
     for t in targets:
         if t == "android":
-            if not build_android(mod, a.abis, a.api):
+            if not build_android(mod, abis, a.api):
                 fails.append("android")
         else:
             if not build_desktop(go, mod, t, arch):

@@ -36,6 +36,7 @@ package main
 // Файл БЕЗ build-тега: платформенного здесь ничего нет, вся развилка сидит в `dialControl` модуля.
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strings"
@@ -95,7 +96,12 @@ func (r *protectedResolver) LookupHost(host string) ([]string, error) {
 		return []string{host}, nil
 	}
 	if r == nil || len(r.servers) == 0 {
-		return net.DefaultResolver.LookupHost(nil, host) //nolint:staticcheck // nil ctx: интерфейс без ctx-параметра, вызов короткий и bounded самим net-пакетом
+		// ⛔ Контекст обязателен: `net` строит из него дедлайн, а `context.WithDeadline` на
+		// nil-родителе ПАНИКУЕТ и убивает процесс хелпера. Бюджет — тот же `dnsQueryTimeout`,
+		// что и у собственного пути: неограниченного ожидания здесь быть не должно.
+		ctx, cancel := context.WithTimeout(context.Background(), dnsQueryTimeout)
+		defer cancel()
+		return net.DefaultResolver.LookupHost(ctx, host)
 	}
 
 	r.mu.Lock()

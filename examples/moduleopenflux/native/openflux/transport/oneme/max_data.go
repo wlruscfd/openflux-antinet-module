@@ -7,8 +7,6 @@ import (
 	"sync/atomic"
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v3"
-
-	"universal-bypass-tool/transport"
 )
 
 type MaxPacket struct {
@@ -61,9 +59,6 @@ type MaxClient struct {
 	loggedIn      bool
 	keepaliveStop chan struct{}
 	onEvent       func(MaxPacket)
-
-	// dial — чем дозванивается сигнальный WebSocket MAX. См. transport/dial.go.
-	dial transport.DialContextFunc
 }
 
 type CallHandler struct {
@@ -94,7 +89,4 @@ type CallHandler struct {
         client            *MaxClient
         running           atomic.Bool
         mu					sync.Mutex
-
-        // dial — чем дозванивается звонковый WebSocket. См. transport/dial.go.
-        dial              transport.DialContextFunc
 }
