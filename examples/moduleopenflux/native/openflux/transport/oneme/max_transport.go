@@ -29,6 +29,18 @@ func (t *OneMeTransport) SetEventCallback(fn func(code, detail string)) {
 	t.b.SetEventCallback(fn)
 }
 
+// ForceReconnect asks the call handler to re-establish on its own
+// reconnect loop (see CallHandler.signalReconnect) instead of waiting for
+// the call itself to notice it's dead - for a caller that already knows
+// the network changed (a mobile OS callback, an AntiNet-style host event).
+// A no-op before Start has set up a handler.
+func (t *OneMeTransport) ForceReconnect() {
+	if t.ch == nil {
+		return
+	}
+	t.ch.signalReconnect()
+}
+
 func NewOneMeTransport(isExit bool, maxToken string, maxUid int64, config transport.TransportConfig) *OneMeTransport {
 	return &OneMeTransport{
 		b:     transport.NewBaseTransport(config),

@@ -23,6 +23,18 @@ type Transport interface {
 	IsConnected() bool
 	Stats() TransportStats
 	SetEventCallback(fn func(code, detail string))
+	// ForceReconnect makes the transport retry right now instead of
+	// whatever it would otherwise be doing: dropping a live connection so
+	// its read loop notices and redials, or skipping the rest of an
+	// in-progress backoff wait between attempts. For a caller that knows
+	// the current connection is dead or about to be (a mobile OS reporting
+	// a network change, a host signaling the same thing some other way)
+	// before the transport's own read/write would ever notice on its own -
+	// see yandex.(*YandexDocsTransport).ForceReconnect for why that matters
+	// on a network that goes silent instead of resetting the connection.
+	// A no-op is a valid implementation for a transport with nothing
+	// meaningful to interrupt.
+	ForceReconnect()
 }
 
 // Event codes reported via SetEventCallback/EmitEvent, for a human-facing
@@ -193,3 +205,8 @@ func (b *BaseTransport) RecordReconnect() {
 func (b *BaseTransport) GetConfig() TransportConfig {
 	return b.config
 }
+
+// ForceReconnect is the default no-op: a base for transports with nothing
+// worth interrupting. yandex.YandexDocsTransport overrides this with a real
+// implementation; see the Transport interface's doc comment.
+func (b *BaseTransport) ForceReconnect() {}

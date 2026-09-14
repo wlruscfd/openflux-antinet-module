@@ -152,6 +152,10 @@ type YandexDocsTransport struct {
 	// the legacy one-packet-per-message format instead of sending
 	// something the other side can't parse.
 	peerBatches atomic.Bool
+
+	// wakeReconnect, guarded by Mu, is non-nil exactly while scheduleReconnect
+	// is sleeping out a backoff delay between attempts - see ForceReconnect.
+	wakeReconnect chan struct{}
 }
 
 func NewYandexDocsTransport(url string, config transport.TransportConfig) *YandexDocsTransport {
@@ -727,13 +731,64 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int, reasonCode string, 
 	causeText := strings.ReplaceAll(cause.Error(), "\n", " ")
 	t.EmitEvent(transport.EventRetrying, fmt.Sprintf("%d|%d|%s|%s", attempt+1, int(delay.Seconds()), reasonCode, causeText))
 	if delay > 0 {
-		time.Sleep(delay)
+		// wake lets ForceReconnect cut this short - published under Mu so a
+		// concurrent ForceReconnect either sees it (and closes it, ending
+		// the select below immediately) or arrives too early/late to matter
+		// (nothing to interrupt in either case, same as before this field
+		// existed).
+		wake := make(chan struct{})
+		t.Mu.Lock()
+		t.wakeReconnect = wake
+		t.Mu.Unlock()
+
+		select {
+		case <-time.After(delay):
+		case <-wake:
+			utils.Debugf("[YDOCS] backoff wait cut short by ForceReconnect")
+		}
+
+		t.Mu.Lock()
+		if t.wakeReconnect == wake {
+			t.wakeReconnect = nil
+		}
+		t.Mu.Unlock()
 	}
 	if !t.IsRunning() {
 		return
 	}
 
 	t.connectToDoc(attempt + 1)
+}
+
+// ForceReconnect makes the transport retry right now: drops a live
+// connection so its read loop notices and redials through the usual
+// scheduleReconnect path, or, if no connection is up and it's instead
+// sleeping out a backoff delay between attempts, cuts that wait short. A
+// no-op if neither applies (not started yet, or already mid-attempt past
+// the wait).
+//
+// Why this exists at all: a network change (Wi-Fi to mobile data, or back)
+// often leaves the old socket silently dead rather than reset - nothing
+// tells this transport's read loop the connection is gone until a read
+// finally times out, which can take far longer than the backoff delay this
+// skips. A caller that already knows the network changed (a mobile OS
+// callback, an AntiNet-style host event) can report that here instead of
+// waiting for TCP to notice on its own.
+func (t *YandexDocsTransport) ForceReconnect() {
+	t.Mu.Lock()
+	session := t.session
+	wake := t.wakeReconnect
+	t.wakeReconnect = nil // claimed here, under the same lock, so a second concurrent call can't double-close wake below
+	t.Mu.Unlock()
+
+	if session != nil && session.Conn != nil {
+		utils.Debugf("[YDOCS] force-reconnect: dropping live session to re-dial")
+		_ = session.Conn.Close()
+		return
+	}
+	if wake != nil {
+		close(wake)
+	}
 }
 
 func (t *YandexDocsTransport) backoffDelay(attempt int) time.Duration {
