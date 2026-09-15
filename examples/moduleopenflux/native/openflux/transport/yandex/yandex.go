@@ -803,6 +803,17 @@ func (t *YandexDocsTransport) backoffDelay(attempt int) time.Duration {
 	}
 
 	delay := float64(cfg.ReconnectDelay) * math.Pow(multiplier, float64(attempt))
+	// +0-50% jitter, applied before the cap so MaxReconnectDelay stays a
+	// true ceiling: every reconnect dials a brand new WebSocket, which
+	// Yandex's own doc-collab backend registers as a brand new participant
+	// in the room regardless of client-side user-id reuse (ported from
+	// upstream p1neappleXpress/OpenFlux, which found this live - "ghost"
+	// participants piling up across a failure streak, logged from the
+	// server's own participant-list messages). Without jitter, many clients
+	// losing the same document at once (a network-wide blip, an exit-node
+	// restart) would retry in lockstep at identical delays instead of
+	// spreading out.
+	delay += delay * 0.5 * rand.Float64()
 	if cfg.MaxReconnectDelay > 0 && delay > float64(cfg.MaxReconnectDelay) {
 		delay = float64(cfg.MaxReconnectDelay)
 	}

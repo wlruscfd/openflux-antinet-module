@@ -361,22 +361,23 @@ func TestBackoffDelayGrowsAndCaps(t *testing.T) {
 		MaxReconnectDelay:   1 * time.Second,
 	})
 
-	got0 := tr.backoffDelay(0)
-	got1 := tr.backoffDelay(1)
-	got2 := tr.backoffDelay(2)
-	gotCapped := tr.backoffDelay(10)
+	// backoffDelay adds up to +50% jitter (see its doc comment), so each
+	// uncapped value is checked as a range [base, base*1.5] rather than an
+	// exact figure.
+	assertInJitterRange(t, tr.backoffDelay(0), 100*time.Millisecond)
+	assertInJitterRange(t, tr.backoffDelay(1), 200*time.Millisecond)
+	assertInJitterRange(t, tr.backoffDelay(2), 400*time.Millisecond)
 
-	if got0 != 100*time.Millisecond {
-		t.Errorf("backoffDelay(0) = %v, want 100ms", got0)
+	if gotCapped := tr.backoffDelay(10); gotCapped != 1*time.Second {
+		t.Errorf("backoffDelay(10) = %v, want capped at 1s even with jitter", gotCapped)
 	}
-	if got1 != 200*time.Millisecond {
-		t.Errorf("backoffDelay(1) = %v, want 200ms", got1)
-	}
-	if got2 != 400*time.Millisecond {
-		t.Errorf("backoffDelay(2) = %v, want 400ms", got2)
-	}
-	if gotCapped != 1*time.Second {
-		t.Errorf("backoffDelay(10) = %v, want capped at 1s", gotCapped)
+}
+
+func assertInJitterRange(t *testing.T, got, base time.Duration) {
+	t.Helper()
+	max := time.Duration(float64(base) * 1.5)
+	if got < base || got > max {
+		t.Errorf("got %v, want in [%v, %v] (base + 0-50%% jitter)", got, base, max)
 	}
 }
 
