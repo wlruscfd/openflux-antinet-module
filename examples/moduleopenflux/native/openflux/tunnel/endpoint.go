@@ -66,6 +66,24 @@ func (e *TunnelLinkEndpoint) InjectInbound(data []byte) {
 		return
 	}
 
+	// This tunnel is TCP-only by construction (see the SOCKS5 UDP ASSOCIATE
+	// 0x07 rejection elsewhere) - the stack's own protocol registration
+	// matches (ipv4 + tcp/udp, no icmp; see tunnel.go), and its NAT/
+	// forwarding code (SetForwardingDefaultAndAllNICs, exit-node only)
+	// nil-pointer-panics trying to handle a protocol it has no registered
+	// handler for instead of returning an error. Confirmed in production
+	// logs: proto=1 (ICMP) - a client's own OS routing a ping, or its own
+	// path-MTU probing, into the tunnel's default route, not anything this
+	// tool ever sends itself. Dropping it here, before it can reach
+	// DeliverNetworkPacket, is the same outcome the recover() below already
+	// produces (packet dropped, everything else keeps working) without
+	// paying for a panic - and, on an exit node under real traffic, without
+	// the same bad packet being retransmitted by the sender and re-panicking
+	// on every single retry.
+	if len(data) < 20 || data[9] != 6 {
+		return
+	}
+
 	// gvisor panics on some inputs it doesn't expect instead of returning an
 	// error - seen in production as "panic: unexpected transport protocol =
 	// 0" from its NAT/conntrack code (SetForwardingDefaultAndAllNICs, used
@@ -73,7 +91,10 @@ func (e *TunnelLinkEndpoint) InjectInbound(data []byte) {
 	// runs on a shared per-transport goroutine (the covert channel's own
 	// read loop), so an unrecovered panic here doesn't just drop this one
 	// packet - it takes the whole process down, disconnecting every client
-	// this exit node was serving. One bad packet dropped beats that.
+	// this exit node was serving. One bad packet dropped beats that. Kept
+	// as a backstop even after the protocol check above: that check only
+	// covers the one specific cause already confirmed in production, not
+	// every input gvisor might ever choke on.
 	defer func() {
 		if r := recover(); r != nil {
 			// Always logged (not gated behind utils.IsVerbose() like the
