@@ -66,21 +66,23 @@ func (e *TunnelLinkEndpoint) InjectInbound(data []byte) {
 		return
 	}
 
-	// This tunnel is TCP-only by construction (see the SOCKS5 UDP ASSOCIATE
-	// 0x07 rejection elsewhere) - the stack's own protocol registration
-	// matches (ipv4 + tcp/udp, no icmp; see tunnel.go), and its NAT/
-	// forwarding code (SetForwardingDefaultAndAllNICs, exit-node only)
-	// nil-pointer-panics trying to handle a protocol it has no registered
-	// handler for instead of returning an error. Confirmed in production
-	// logs: proto=1 (ICMP) - a client's own OS routing a ping, or its own
-	// path-MTU probing, into the tunnel's default route, not anything this
-	// tool ever sends itself. Dropping it here, before it can reach
+	// The stack only registers TCP and UDP transport handlers (see
+	// tunnel.go's stack.New call) - anything else (ICMP, etc.) has no
+	// registered handler, and its NAT/forwarding code
+	// (SetForwardingDefaultAndAllNICs, exit-node only) nil-pointer-panics
+	// trying to dispatch such a packet instead of returning an error.
+	// Confirmed in production logs: proto=1 (ICMP) - a client's own OS
+	// routing a ping, or its own path-MTU probing, into the tunnel's default
+	// route, not anything this tool ever sends itself. Dropping anything
+	// that isn't TCP(6) or UDP(17) here, before it can reach
 	// DeliverNetworkPacket, is the same outcome the recover() below already
 	// produces (packet dropped, everything else keeps working) without
 	// paying for a panic - and, on an exit node under real traffic, without
 	// the same bad packet being retransmitted by the sender and re-panicking
-	// on every single retry.
-	if len(data) < 20 || data[9] != 6 {
+	// on every single retry. UDP must stay allowed through: it's how general
+	// UDP relay (not just TCP) works in raw exit mode (see ExitModeRaw's doc
+	// comment) and how the mobile client's gateway relays DNS/UDP traffic.
+	if len(data) < 20 || (data[9] != 6 && data[9] != 17) {
 		return
 	}
 

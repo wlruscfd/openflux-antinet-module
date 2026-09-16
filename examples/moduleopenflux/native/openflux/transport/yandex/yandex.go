@@ -777,11 +777,17 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int, reasonCode string, 
 func (t *YandexDocsTransport) ForceReconnect() {
 	t.Mu.Lock()
 	session := t.session
+	// t.session is never nil'd on disconnect (see connectToDoc/writerLoop's
+	// comment on the same fact) - it keeps pointing at the last session,
+	// live or not, so session != nil alone can't tell "connected right now"
+	// apart from "sleeping out a backoff with a stale session left over".
+	// IsConnected() is the field that actually tracks that distinction.
+	live := t.IsConnected()
 	wake := t.wakeReconnect
 	t.wakeReconnect = nil // claimed here, under the same lock, so a second concurrent call can't double-close wake below
 	t.Mu.Unlock()
 
-	if session != nil && session.Conn != nil {
+	if live && session != nil && session.Conn != nil {
 		utils.Debugf("[YDOCS] force-reconnect: dropping live session to re-dial")
 		_ = session.Conn.Close()
 		return
