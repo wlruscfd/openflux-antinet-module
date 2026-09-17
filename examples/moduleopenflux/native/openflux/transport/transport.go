@@ -72,17 +72,11 @@ type TransportStats struct {
 func DefaultConfig() TransportConfig {
 	return TransportConfig{
 		MaxReconnectAttempts: 999999,
-		// A previous version of this config carried ReconnectDelay: 0, which
-		// made the (already-unused-until-now) exponential backoff a permanent
-		// no-op: 0 * anything is still 0. Transports now actually apply
-		// this - see yandex.(*YandexDocsTransport).backoffDelay - so a
-		// failing connection retries with real, growing delays instead of
-		// hammering the server in a tight loop.
-		ReconnectDelay:      500 * time.Millisecond,
-		ReconnectMultiplier: 1.6,
-		MaxReconnectDelay:   30 * time.Second,
-		MaxQueueSize:        1024,
-		KeepAliveInterval:   10 * time.Second,
+		ReconnectDelay:       500 * time.Millisecond,
+		ReconnectMultiplier:  1.6,
+		MaxReconnectDelay:    30 * time.Second,
+		MaxQueueSize:         1024,
+		KeepAliveInterval:    10 * time.Second,
 	}
 }
 
@@ -173,7 +167,6 @@ func (b *BaseTransport) EmitEvent(code, detail string) {
 func (b *BaseTransport) GetSession(accessor func(interface{})) {
 	b.Mu.RLock()
 	defer b.Mu.RUnlock()
-	// This is a helper for subclasses
 }
 
 func (b *BaseTransport) Stats() TransportStats {

@@ -193,14 +193,10 @@ func parseOpenFluxLink(raw string) (openFluxLink, error) {
 	return l, nil
 }
 
-// decodeImportLink parses openflux-server's deep-link payload
-// (openflux://import?data=<base64url-no-pad JSON>, see this file's header
-// comment for the exact JSON shape and https://github.com/wlruscfd/openflux-server's
-// controlplane/internal/api/deeplink.go for where it's generated). Returns
-// the transport name and, for yandex, the doc URL directly out of the
-// link - never dials control_url, for the same reason the fork's own
-// Android app doesn't: that request would go to a bare IP with none of the
-// tunnel's own disguise.
+// decodeImportLink parses openflux-server's deep-link payload (header comment
+// above has the JSON shape). Never dials control_url — same reason the fork's
+// own Android app doesn't: that request would hit a bare IP with none of the
+// tunnel's disguise.
 func decodeImportLink(q url.Values) (transportName, docURL, name string, err error) {
 	raw, derr := base64.RawURLEncoding.DecodeString(q.Get("data"))
 	if derr != nil {
@@ -243,7 +239,6 @@ func (l openFluxLink) server() string {
 	return "max.ru:" + strconv.FormatInt(l.UID, 10)
 }
 
-// displayName — имя для карточки: фрагмент ссылки, иначе — осмысленный дефолт по транспорту.
 func (l openFluxLink) displayName() string {
 	if l.Name != "" {
 		return l.Name

@@ -128,20 +128,17 @@ type YandexDocsTransport struct {
 	baseUserID  string
 
 	// recentSent guards against processing our own data. Yandex's doc
-	// broadcasts every "cursor" event to every participant in the
-	// document, sender included - the same self-echo a collaborative
-	// editor's cursor broadcast normally is. Nothing here previously
-	// checked authorship before decoding a "cursor" message and handing it
-	// to CallReceive, so a tunnel packet we ourselves just sent (see
-	// writerLoop) came right back over the same socket and got reinjected
-	// as if the peer had sent it - a real packet, correctly formed, just
-	// flowing in a direction gvisor's NAT/forwarding never expects on that
-	// NIC (that's what "unexpected transport protocol = 0" turned out to
-	// be a symptom of, not a cause). Recording a short-lived hash of every
-	// payload we send and skipping any inbound payload that matches lets
-	// this be caught without needing to know Yandex's exact broadcast
-	// wrapping format, and without touching the wire format the real
-	// backend expects.
+	// broadcasts every "cursor" event to every participant in the document,
+	// sender included - the same self-echo a collaborative editor's cursor
+	// broadcast normally is. A tunnel packet we ourselves just sent (see
+	// writerLoop) comes back over the same socket and would be reinjected as
+	// if the peer sent it - a real, correctly-formed packet just flowing in a
+	// direction gvisor's NAT/forwarding never expects on that NIC (this is
+	// what surfaces as "unexpected transport protocol = 0", not a cause of
+	// it). Recording a short-lived hash of every payload we send and
+	// skipping any inbound payload that matches catches this without needing
+	// Yandex's exact broadcast wrapping format, or touching the wire format
+	// the real backend expects.
 	recentSentMu sync.Mutex
 	recentSent   map[uint32]time.Time
 
@@ -204,14 +201,11 @@ func (t *YandexDocsTransport) Start() error {
 
 // Send queues data for the writer loop to actually put on the wire.
 // Deliberately does not require IsConnected(): a session's WriteQueue is
-// reused across a reconnect (see connectToDoc) precisely so a brief drop
-// doesn't have to lose data, but an early return here for "not connected
-// right now" was throwing every packet away for the entire reconnect
-// window regardless - the queue existed but nothing during a drop ever
-// reached it. A connection blip that would otherwise have been invisible
-// (queued, then drained once the new session comes up) was instead forcing
-// the real end-to-end TCP connection several hops away to notice the loss
-// and retransmit on its own, much slower, timeout.
+// reused across a reconnect (see connectToDoc), so a brief drop just queues
+// data until the new session drains it - checking IsConnected() here would
+// make that blip visible as loss, forcing the real end-to-end TCP connection
+// several hops away to notice and retransmit on its own, much slower,
+// timeout.
 func (t *YandexDocsTransport) Send(data []byte) error {
 	t.Mu.RLock()
 	session := t.session
@@ -463,15 +457,11 @@ func (t *YandexDocsTransport) writerLoop(queue chan []byte) {
 	for t.IsRunning() {
 		// t.session is never nil'd on disconnect (see connectToDoc) - it
 		// keeps pointing at the old, now-dead session until a new one
-		// replaces it, so checking session/session.Conn for nil here never
-		// actually catches a drop. Without also checking IsConnected(),
-		// this dequeued a packet from the queue - the one piece of state
-		// Send's fix relies on to survive a reconnect - and then threw it
-		// away on the write to that dead connection anyway, every single
-		// time. Waiting for IsConnected() before ever touching the channel
-		// is what actually keeps queued data queued until a live session
-		// exists to drain it into - batch (if anything is held) waits here
-		// right along with it, for the same reason.
+		// replaces it, so checking session/session.Conn for nil here can't
+		// detect a drop; only IsConnected() distinguishes a live session from
+		// a stale pointer. Waiting on it before touching the channel is what
+		// keeps queued data queued (and batch, if anything is held) until a
+		// live session exists to drain it into.
 		t.Mu.RLock()
 		session := t.session
 		connected := t.IsConnected()
@@ -877,13 +867,12 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 		return YandexDocsInfo{}, fmt.Errorf("parse client-config: %w", err)
 	}
 
-	// Every lookup below used to be an unchecked type assertion
-	// (config["x"].(T)), which panics - and since this runs in a goroutine
-	// with no recover(), crashes the entire process - the moment Yandex
-	// serves a page shaped even slightly differently than expected (an
+	// Every lookup below is checked rather than a bare type assertion
+	// (config["x"].(T)) - this runs in a goroutine with no recover(), so a
+	// panic here would crash the entire process the moment Yandex serves a
+	// page shaped even slightly differently than expected (an
 	// error/maintenance page, an A/B-tested layout, a partly-loaded
-	// response). All of it is now checked and turned into a plain error
-	// that triggers a reconnect instead.
+	// response).
 	officeAction, ok := config["officeActionData"].(map[string]interface{})
 	if !ok {
 		utils.Debugf("[YDOCS] config top-level keys: %v", mapKeys(config))

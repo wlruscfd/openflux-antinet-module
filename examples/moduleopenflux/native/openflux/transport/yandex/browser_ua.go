@@ -6,15 +6,13 @@ import "net/http"
 // fingerprint, shared by every request this package makes to Yandex's own
 // servers (fetchDocInfo/WebSocket dial here, volgaUserAgent in volga.go).
 //
-// Yandex's own bot detection has reportedly gotten more aggressive lately:
-// a CAPTCHA page in place of the real client-config, especially from VPS
-// IP ranges outside Russia. A convincing header set can't fix IP-
-// reputation-based challenges (a datacenter IP can still get flagged no
-// matter how real the headers look - that part genuinely isn't something
-// request headers can work around), but fetchDocInfo's own request used to
-// set User-Agent and nothing else - no real browser ever makes a request
-// that bare, and that mismatch alone is exactly the kind of signal
-// detection keys off before IP reputation even enters into it.
+// Yandex's bot detection has gotten more aggressive: a CAPTCHA page in place
+// of the real client-config, especially from VPS IP ranges outside Russia. A
+// convincing header set can't fix IP-reputation-based challenges (a
+// datacenter IP can still get flagged no matter how real the headers look),
+// but a request that sets only User-Agent and nothing else is a mismatch no
+// real browser produces - exactly the kind of signal detection keys off
+// before IP reputation even enters into it.
 const browserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0"
 
 // applyBrowserGetHeaders sets the header set a real Firefox top-level page
