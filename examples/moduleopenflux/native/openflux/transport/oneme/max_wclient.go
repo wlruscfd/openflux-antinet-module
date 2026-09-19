@@ -41,9 +41,7 @@ func (c *MaxClient) Connect() error {
 func (c *MaxClient) SetEventCallback(cb func(MaxPacket)) { c.onEvent = cb }
 
 func (c *MaxClient) readLoop() {
-	// See CallHandler.readLoop's doc comment: an unrecovered panic here
-	// kills the whole exit-node process, every other key's transport
-	// included.
+	// An unrecovered panic here kills the whole exit-node process, every other key's transport included.
 	defer func() {
 		if r := recover(); r != nil {
 			logError("recovered in MaxClient.readLoop: %v", r)
@@ -110,10 +108,7 @@ func (c *MaxClient) LoginByToken(token string) error {
 	}
 	c.loggedIn = true
 	go c.keepalive()
-	// Список контактов аккаунта (имена, телефоны) в stdout НЕ печатается: stdout helper'а
-	// редиректится хостом в `helper.stdout.log`, который читают глазами и грепом и который целиком
-	// уезжает в баг-репорты. MODULE_API §2.9 требует от этих строк ASCII, а телефонам третьих лиц
-	// в диагностическом логе VPN-клиента места нет.
+	// Contact names/phone numbers are never printed to stdout - it ends up in bug reports.
 	return nil
 }
 

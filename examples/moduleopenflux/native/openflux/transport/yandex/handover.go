@@ -1,12 +1,6 @@
 package yandex
 
-// Handover — сеть под транспортом сменилась (событие хоста, MODULE_API §2.8). ForceReconnect и
-// рвёт живую сессию, и обрывает ожидание backoff между попытками, если сессии как раз нет: без
-// этого "netback" после реального обрыва сети ждал бы весь накопленный backoff (до 30с) впустую,
-// хотя сеть уже вернулась. Модулю остаётся только назвать вещь его именем в терминах §2.8.
-//
-// Отдельным файлом, а не правкой `yandex.go`: тот — дословная копия openflux-server, и апстрим-бамп
-// сводится к перезаписи файла.
+// Handover reconnects on a host network-change event (MODULE_API §2.8) instead of waiting out the full backoff.
 func (t *YandexDocsTransport) Handover() {
 	t.ForceReconnect()
 }

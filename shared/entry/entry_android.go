@@ -11,33 +11,11 @@ import "C"
 
 import "unsafe"
 
-// КАНОН shared/entry — ANDROID-вход модуля. Инжектируется build.py в main-пакет
-// КАЖДОГО модуля (гейта нет). Парная десктопная половина — entry_native.go.
-//
-// ⛔ Своей копии не заводи: набор и сигнатуры экспортов — часть C-ABI, по которому слот-процесс
-// зовёт модуль через dlsym. Разойтись с ним можно молча (шим просто не найдёт символ), и увидишь
-// это только на устройстве.
-//
-// На Android модуль — не процесс, а БИБЛИОТЕКА: скачанный файл запустить нельзя (W^X с API 29+
-// бьёт по execve любого writable-файла), а dlopen под запрет не попадает (живо проверено на
-// устройстве). Поэтому сборка идёт `-buildmode=c-shared`, а слот AntiNet грузит .so C-шимом и
-// зовёт экспорты ниже.
-//
-// ОТ МОДУЛЯ НУЖНЫ ДВЕ ФУНКЦИИ, и больше ничего:
-//
-//	func realMain(configContent, resolversPath, profileDir, protectPath string, listenFd int) int
-//	func moduleCall(verb, arg string) string
-//
-// c-shared требует объявленного main() у package main (рантайм ссылается на runtime.main_main·f при
-// линковке), хотя НИКОГДА его не вызывает: точка входа здесь — antinet_module_run. Тело пустое.
+// shared/entry is the Android entry point, injected by build.py into every module's main package.
+// main is never called, but c-shared requires it declared in package main.
 func main() {}
 
-// antinet_module_run — единственная обязательная точка входа (MODULE_API §2.3). Блокирует, как main().
-//
-//	configContent — СОДЕРЖИМОЕ конфига, а не путь: секреты (SOCKS_PASS, апстримный секрет внутри
-//	                LINK=) не должны касаться диска (§3).
-//	listenFd      — готовый слушающий SOCKS5-сокет: им владеет ХОСТ (§2.6), сокет переживает
-//	                смерть/подмену модуля, а порт хост знает сразу и авторитетно.
+// antinet_module_run is the module's one required entry point (MODULE_API §2.3); configContent is the config's content, not a path.
 //
 //export antinet_module_run
 func antinet_module_run(configContent, resolversPath, profileDir, protectPath *C.char, listenFd C.int) C.int {

@@ -23,39 +23,17 @@ type Transport interface {
 	IsConnected() bool
 	Stats() TransportStats
 	SetEventCallback(fn func(code, detail string))
-	// ForceReconnect makes the transport retry right now instead of
-	// whatever it would otherwise be doing: dropping a live connection so
-	// its read loop notices and redials, or skipping the rest of an
-	// in-progress backoff wait between attempts. For a caller that knows
-	// the current connection is dead or about to be (a mobile OS reporting
-	// a network change, a host signaling the same thing some other way)
-	// before the transport's own read/write would ever notice on its own -
-	// see yandex.(*YandexDocsTransport).ForceReconnect for why that matters
-	// on a network that goes silent instead of resetting the connection.
-	// A no-op is a valid implementation for a transport with nothing
-	// meaningful to interrupt.
+	// ForceReconnect makes the transport retry right now instead of waiting out its current backoff; a no-op is valid.
 	ForceReconnect()
 }
 
-// Event codes reported via SetEventCallback/EmitEvent, for a human-facing
-// connection log distinct from the coarser started/connected/stopped
-// lifecycle a caller already gets some other way (e.g. mobile.Callback's
-// OnStatus). detail's shape depends on code and is documented at each
-// emitter - see yandex.YandexDocsTransport for the concrete transport that
-// currently reports these.
+// Event codes reported via SetEventCallback/EmitEvent for a human-facing connection log.
 const (
-	// EventConnecting fires once per connection attempt, before it starts.
-	// detail is the 1-based attempt number.
+	// EventConnecting fires once per connection attempt, before it starts; detail is the 1-based attempt number.
 	EventConnecting = "connecting"
-	// EventConnected fires once a connection attempt succeeds. detail is
-	// the 1-based attempt number that succeeded.
+	// EventConnected fires once a connection attempt succeeds; detail is the 1-based attempt number that succeeded.
 	EventConnected = "connected"
-	// EventRetrying fires when an attempt fails and another is scheduled
-	// after a backoff delay. detail is
-	// "<failed attempt>|<delay seconds>|<reason code>|<cause>", where cause
-	// is the actual error's text (single line, newlines stripped) - reason
-	// code alone only says which of a handful of fixed categories the
-	// failure falls into, not what specifically went wrong.
+	// EventRetrying's detail is "<failed attempt>|<delay seconds>|<reason code>|<cause>".
 	EventRetrying = "retrying"
 )
 
@@ -144,17 +122,14 @@ func (b *BaseTransport) CallReceive(data []byte) {
 	}
 }
 
-// SetEventCallback registers fn to receive connection-lifecycle events (see
-// the Event* constants) via EmitEvent. Not safe to change once a transport
-// has started emitting - callers set it once, right after construction.
+// SetEventCallback is not safe to change once a transport has started emitting - callers set it once, after construction.
 func (b *BaseTransport) SetEventCallback(fn func(code, detail string)) {
 	b.Mu.Lock()
 	defer b.Mu.Unlock()
 	b.eventCallback = fn
 }
 
-// EmitEvent reports one event to whatever SetEventCallback registered, if
-// anything. Concrete transports call this; it's a no-op with none set.
+// EmitEvent reports one event to whatever SetEventCallback registered; a no-op with none set.
 func (b *BaseTransport) EmitEvent(code, detail string) {
 	b.Mu.RLock()
 	fn := b.eventCallback
@@ -199,7 +174,5 @@ func (b *BaseTransport) GetConfig() TransportConfig {
 	return b.config
 }
 
-// ForceReconnect is the default no-op: a base for transports with nothing
-// worth interrupting. yandex.YandexDocsTransport overrides this with a real
-// implementation; see the Transport interface's doc comment.
+// ForceReconnect is the default no-op; yandex.YandexDocsTransport overrides it with a real implementation.
 func (b *BaseTransport) ForceReconnect() {}

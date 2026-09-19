@@ -18,14 +18,7 @@ import (
 	"universal-bypass-tool/utils"
 )
 
-// Клиентская сторона туннеля OpenFlux.
-//
-// Wire-формат — СЫРЫЕ IPv4-пакеты в транспорте: у клиента свой gVisor-стек с адресом 10.10.10.2/24,
-// его link-endpoint (endpoint.go) отдаёт исходящие пакеты в `trans.Send`, а всё принятое инжектит
-// обратно через `InjectInbound`; exit-node на той стороне высыпает их в raw-socket. Собственного
-// фрейминга у протокола нет, и заводить его нельзя: любой «свой» заголовок exit-node скормит в
-// `InjectInbound`, gVisor разберёт его как IPv4 и молча дропнет — туннель поднимется, трафик не
-// пойдёт.
+// The client side of the OpenFlux tunnel; the wire format is raw IPv4 packets, with no framing of its own.
 
 type TCPTunnel struct {
 	gvisorStack *stack.Stack
@@ -35,9 +28,7 @@ type TCPTunnel struct {
 	packetCount atomic.Uint64
 }
 
-// clientAddr — адрес клиента в туннельной подсети. Фиксирован протоколом: exit-node маршрутизирует
-// 10.10.10.0/24 в туннельный NIC, а адрес клиента в нём один. Отсюда же следует, что ДВА клиента на
-// одном exit-node сталкиваются — поэтому дескриптор объявляет `parallelPing: false`.
+// clientAddr is fixed by the protocol: the exit node routes 10.10.10.0/24 to one client address only.
 var clientAddr = tcpip.AddrFrom4([4]byte{10, 10, 10, 2})
 
 func NewTCPTunnel(trans transport.Transport) *TCPTunnel {
@@ -97,9 +88,7 @@ func (t *TCPTunnel) setupClient(tunnelNIC tcpip.NICID) {
 	})
 }
 
-// DialTCP — дозвон ВНУТРИ туннеля. `address` обязан быть литеральным `ip:port` (IPv4): резолв —
-// обязанность вызывающего, его protected off-tunnel резолвером (MODULE_API §2.3 п.2), иначе
-// резолв-сокет уходит в TUN. Дедлайн берётся из ctx — стек gVisor сам по себе не сдаётся никогда.
+// DialTCP requires address to be a literal IPv4 ip:port - the caller must resolve it off-tunnel first (MODULE_API §2.3 p.2).
 func (t *TCPTunnel) DialTCP(ctx context.Context, address string) (net.Conn, error) {
 	host, portStr, err := net.SplitHostPort(address)
 	if err != nil {
@@ -107,8 +96,7 @@ func (t *TCPTunnel) DialTCP(ctx context.Context, address string) (net.Conn, erro
 	}
 	ip := net.ParseIP(host)
 	if ip == nil {
-		// Осознанный отказ, а не фоллбэк на системный резолв: тот уходит в TUN (Husi-pattern —
-		// UID модуля ВНУТРИ туннеля), и «прямая» проба начинает отвечать про туннель.
+		// Deliberate refusal, not a fallback to the system resolver, which would itself route through the TUN.
 		return nil, fmt.Errorf("DialTCP: %q is not a literal IP (caller must resolve)", host)
 	}
 	ip4 := ip.To4()

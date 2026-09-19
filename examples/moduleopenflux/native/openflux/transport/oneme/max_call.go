@@ -29,8 +29,7 @@ func (h *CallHandler) Send(data []byte) {
 }
 
 func (h *CallHandler) readLoop() {
-	// This process serves many keys at once (nodeagent.Orchestrator) - an
-	// unrecovered panic here would kill every other key's transport too.
+	// This process serves many keys at once - an unrecovered panic here would kill every other key's transport too.
 	defer func() {
 		if r := recover(); r != nil {
 			logError("recovered in CallHandler.readLoop: %v", r)
@@ -89,10 +88,7 @@ func (h *CallHandler) signalReconnect() {
 		default:
 		}
 	} else {
-		// No auto-reconnect for the receiver role yet (matching upstream,
-		// which also sends this signal into a reconnectCh nobody reads for
-		// this role) - fail only this call handler rather than the process,
-		// since one process serves many keys at once (nodeagent.Orchestrator).
+		// No auto-reconnect for the receiver role yet - fail only this call handler, not the process.
 		logError("[%s] Receiver connection died - this call is over, other keys are unaffected", h.tag)
 	}
 }

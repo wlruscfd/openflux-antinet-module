@@ -6,16 +6,12 @@ import (
 	"strings"
 )
 
-// TCPChecksum / UDPChecksum are the same RFC 793/768 sum, differing only in the protocol number
-// inside the pseudo-header. Separate bodies would drift on the first edit, so both are thin
-// wrappers over L4Checksum; the names are kept so callers have nothing new to learn.
+// TCPChecksum and UDPChecksum are thin wrappers over L4Checksum, differing only in the protocol number.
 func TCPChecksum(tcpData []byte, srcIP, dstIP [4]byte) uint16 {
 	return L4Checksum(tcpData, srcIP, dstIP, 6)
 }
 
-// UDPChecksum. Note: over IPv4 the UDP checksum field is optional (0 means "not computed"), but it
-// must not be zeroed here — the exit node rewrites the packet's addresses and the sum covers them,
-// so a surviving old value would be wrong and the receiver would drop the datagram silently.
+// UDPChecksum must not zero an unset checksum here - the exit node rewrites addresses that the sum covers.
 func UDPChecksum(udpData []byte, srcIP, dstIP [4]byte) uint16 {
 	return L4Checksum(udpData, srcIP, dstIP, 17)
 }

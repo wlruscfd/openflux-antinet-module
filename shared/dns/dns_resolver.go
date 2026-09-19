@@ -2,38 +2,7 @@
 
 package main
 
-// КАНОН shared/dns — off-tunnel, protected, TTL-cached A/AAAA резолв СОБСТВЕННЫХ
-// dial-таргетов модуля (TCP CONNECT host + SOCKS5 UDP ASSOCIATE domain-таргеты, RFC 1928 §7).
-// Инжектируется build.py в main-пакет helper'а при `"dnsResolver": true`, как shared/offtun и
-// shared/socks5.
-//
-// ⛔ Копию этого файла в своём модуле не заводи (MODULE_API §4). Он инжектируется в КАЖДЫЙ модуль с
-// флагом, и вторая реализация рядом неизбежно с ним разойдётся — не в сборке, а в рантайме.
-//
-// Почему это вообще отдельный резолвер, а не net.DefaultResolver: он нужен модулю, чья dial-цель —
-// РЕАЛЬНЫЙ адрес в интернете, вне собственного туннеля. Такой резолв обязан явно избегать
-// TUN-перехвата тем же способом, что уже защищает CONNECT-сокет (dialControl/SCM_RIGHTS) — иначе
-// резолв-сокет уходит в TUN, перехватывается DNS-hijack правилом и крутится через ЧУЖОЙ
-// (sing-box'овый dns-remote/direct/local) пайплайн: не сломано, но непредсказуемо медленно и
-// зависит от состояния каскада. Модулю, который резолвит ВНУТРИ уже поднятого туннеля (qWDTT — через
-// свой netstack), этот канон не нужен и флаг ему объявлять незачем.
-//
-// От модуля канон требует РОВНО ОДНО: функцию `dialControl(protectPath string, st *protectStat)
-// func(network, address string, c syscall.RawConn) error` — тот же protect-адаптер, что модуль и так
-// держит в своём `platform_android.go`/`platform_other.go` (MODULE_API §4).
-//
-// TTL-кэш + single-flight: без кэша КАЖДОЕ соединение к одному и тому же хосту (типично — сервер
-// каскада) платит полный резолв заново; без single-flight параллельные соединения к тому же хосту
-// дублируют сетевой запрос (thundering herd). Тот же класс защиты, что qWDTT'шный
-// dnsCacheEntry/resolveHostCached, у которого резолв без кэша стоил 5.1-5.4с всплесков.
-//
-// DNS-сервера — С ХОСТА, НЕ хардкод (категорический запрет проекта на публичные резолверы в коде):
-// `DNS_SERVERS=<ip[,ip...]>` — generic KEY=VALUE-ключ конфига, тот же choke point, где хост уже
-// строит LISTEN_PORT/SOCKS_USER/SOCKS_PASS/LINK. Хост населяет его РЕАЛЬНЫМИ физическими DNS
-// адаптера (то же семейство, что ProtectedSocketSupport.kt/physicaladapter.pas уже даёт остальному
-// приложению). Пусто (старый хост / деградация) → фоллбэк на обычный net.DefaultResolver.LookupHost.
-//
-// Файл БЕЗ build-тега: платформенного здесь ничего нет, вся развилка сидит в `dialControl` модуля.
+// shared/dns is off-tunnel, protected, TTL-cached A/AAAA resolution for the module's own dial targets, injected by build.py.
 
 import (
 	"context"
@@ -66,8 +35,7 @@ type protectedResolver struct {
 	inFlight map[string]chan struct{}
 }
 
-// newProtectedResolver — parses DNS_SERVERS (bare IPs or ip:port, comma-separated). Пустой/невалидный
-// вход → резолвер с пустым server-списком, LookupHost сам фоллбэкнет на net.DefaultResolver.
+// newProtectedResolver parses DNS_SERVERS; an empty/invalid input yields an empty server list, and LookupHost falls back.
 func newProtectedResolver(dnsServersCsv, protectPath string) *protectedResolver {
 	var servers []string
 	for _, s := range strings.Split(dnsServersCsv, ",") {
@@ -88,17 +56,13 @@ func newProtectedResolver(dnsServersCsv, protectPath string) *protectedResolver 
 	}
 }
 
-// LookupHost — сигнатура зафиксирована shared/socks5's parseSocksUDP (интерфейс
-// `interface{ LookupHost(string) ([]string, error) }`), используется И этим интерфейсом (UDP
-// ASSOCIATE target-резолв), И напрямую TCP CONNECT-путём (handleConn).
+// LookupHost's signature is fixed by shared/socks5's parseSocksUDP interface; also used directly by the TCP CONNECT path.
 func (r *protectedResolver) LookupHost(host string) ([]string, error) {
 	if ip := net.ParseIP(host); ip != nil {
 		return []string{host}, nil
 	}
 	if r == nil || len(r.servers) == 0 {
-		// ⛔ Контекст обязателен: `net` строит из него дедлайн, а `context.WithDeadline` на
-		// nil-родителе ПАНИКУЕТ и убивает процесс хелпера. Бюджет — тот же `dnsQueryTimeout`,
-		// что и у собственного пути: неограниченного ожидания здесь быть не должно.
+		// A context is required: context.WithDeadline on a nil parent panics and kills the helper process.
 		ctx, cancel := context.WithTimeout(context.Background(), dnsQueryTimeout)
 		defer cancel()
 		return net.DefaultResolver.LookupHost(ctx, host)
@@ -110,8 +74,7 @@ func (r *protectedResolver) LookupHost(host string) ([]string, error) {
 		return e.ips, nil
 	}
 	if ch, ok := r.inFlight[host]; ok {
-		// Резолв ЭТОГО хоста уже идёт на другой горутине — ждём его результат вместо дублирования
-		// сетевого запроса (mirror qWDTT's e.flight single-flight, тот же класс защиты).
+		// This host is already being resolved on another goroutine - wait for its result instead of duplicating the query.
 		r.mu.Unlock()
 		<-ch
 		r.mu.Lock()
@@ -139,9 +102,7 @@ func (r *protectedResolver) LookupHost(host string) ([]string, error) {
 	return ips, err
 }
 
-// queryAll — пробует все сконфигурированные сервера по очереди для A, затем (если ни один не дал
-// A-записи) для AAAA. Первый успех побеждает — не гонка (здесь резолверы — реальные физические DNS,
-// не флакающий in-tunnel путь qWDTT, гонять их параллельно незачем).
+// queryAll tries each configured server in turn for A, then AAAA if none had an A record; first success wins.
 func (r *protectedResolver) queryAll(host string) ([]string, error) {
 	var lastErr error
 	for _, qtype := range [...]dnsmessage.Type{dnsmessage.TypeA, dnsmessage.TypeAAAA} {
@@ -161,8 +122,7 @@ func (r *protectedResolver) queryAll(host string) ([]string, error) {
 	return nil, lastErr
 }
 
-// queryOneServer — один UDP A/AAAA-запрос к конкретному серверу, дозвон ЧЕРЕЗ dialControl (тот же
-// protect-примитив, что уже защищает TCP CONNECT-сокет) — иначе резолв-сокет уходит в TUN.
+// queryOneServer dials through dialControl - the same protect primitive as the TCP CONNECT socket - or the resolve leaks into the TUN.
 func queryOneServer(server, protectPath, host string, qtype dnsmessage.Type, timeout time.Duration) ([]string, error) {
 	fqdn := host
 	if !strings.HasSuffix(fqdn, ".") {

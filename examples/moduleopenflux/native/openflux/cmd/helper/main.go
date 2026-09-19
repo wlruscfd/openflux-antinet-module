@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//
-// OpenFlux — helper протокол-модуля AntiNet. ВЕСЬ модульный код — в этом одном файле: точки входа
-// (C-ABI на Android, argv на десктопе), протокол разговора с хостом, SOCKS5, protect/off-TUN,
-// резолвер и маркер готовности дают КАНОНЫ `shared/*`, которые build.py инжектит перед сборкой.
-//
-// Модуль обязан определить РОВНО ДВЕ функции, и они обе ниже:
-//
-//	realMain(configContent, resolversPath, profileDir, protectPath string, listenFd int) int
-//	moduleCall(verb, arg string) string
-//
-// Data-plane — порт клиентской половины https://github.com/p1neappleXpress/OpenFlux (GPL-3.0):
-// SOCKS5 → netstack → сырые IPv4-пакеты → транспорт (Yandex Docs / MAX) → exit-node.
+
+// OpenFlux AntiNet protocol-module helper; realMain and moduleCall are the two required exports.
 package main
 
 import (
@@ -33,32 +23,7 @@ import (
 	"universal-bypass-tool/utils"
 )
 
-// ── Ссылка ────────────────────────────────────────────────────────────────────────────────────
-//
-// Грамматика (апстрим, https://github.com/p1neappleXpress/OpenFlux):
-//
-//	openflux://yandex?url=<urlencoded адрес документа Яндекс.Документов>[#Имя]
-//	openflux://oneme?token=<токен MAX>&uid=<id собеседника>[#Имя]
-//
-// Схема ОДНА (`openflux`), а транспорт — первый сегмент. Так сделано намеренно: `yandex://` и
-// `oneme://` — слишком общие имена, чтобы занимать их в реестре схем хоста, а различать транспорты
-// внутри своей схемы модулю ничего не стоит.
-//
-// У апстрима формата ссылки нет вовсе — он конфигурируется флагами CLI (`-transport`, `-url`,
-// `-maxToken`, `-maxUid`), поэтому имена параметров взяты оттуда один в один.
-//
-// Плюс форма нашего форка (openflux-server, https://github.com/wlruscfd/openflux-server) — ссылка,
-// которую выдаёт controlplane/админ-панель на созданный ключ (см. её buildDeepLink):
-//
-//	openflux://import?data=<base64url-JSON без паддинга>
-//	JSON = {"name","mode":"key","control_url","key_token","doc_url","transport"}
-//
-// doc_url/transport лежат в самой ссылке (как и Android-приложение форка, этот модуль НЕ ходит на
-// control_url за ними: такой запрос шёл бы на голый IP без маскировки транспорта, и сеть, уже
-// блокирующая прямой доступ к нему, заблокирует и его). control_url/key_token принимаются, но не
-// используются — у модуля нет своей проверки квоты ключа. Публикуется параллельно апстримной форме
-// и не заменяет её: они разбираются одним декодером (parseOpenFluxLink), различаясь только первым
-// сегментом (`import` вместо имени транспорта).
+// Link grammar: openflux://yandex?url=...[#Name] | openflux://oneme?token=...&uid=...[#Name] | openflux://import?data=<base64url JSON>.
 const (
 	linkScheme       = "openflux"
 	linkHostImport   = "import" // openflux://import?data=... — см. decodeImportLink
@@ -72,12 +37,7 @@ const (
 	dnsQueryFamilyV4 = 4
 )
 
-// ── Локализация текста для юзера (MODULE_API §2.9) ────────────────────────────────────────────
-//
-// Граница проходит по ПРИЁМНИКУ, а не по маркеру: текст ПОСЛЕ тега в `PROGRESS|`/`LOG|` юзер видит
-// тостом и на экране «Логи», значит он обязан быть на языке AntiNet (`APP_LANG` из конфига). Сами
-// теги, таймстамп-префикс, `detail` у `STATUS|` и весь `log.Printf` остаются ASCII/английскими:
-// первые разбирает хост, вторые читает разработчик грепом.
+// User-facing text after PROGRESS|/LOG| tags must be in APP_LANG (MODULE_API §2.9); tags and log.Printf stay ASCII/English.
 type ofStrings struct {
 	badLinkFmt              string // %v — ошибка разбора
 	openingTransportFmt     string // %s — имя транспорта
@@ -119,8 +79,7 @@ func ofStringsFor(lang string) ofStrings {
 	return ofStringsEN
 }
 
-// openFluxLink — разобранная ссылка. Поля повторяют флаги апстрима, чтобы сверка «что приехало»
-// сводилась к чтению одной структуры.
+// openFluxLink is a parsed link; fields mirror upstream's CLI flags one-to-one.
 type openFluxLink struct {
 	Transport string // yandex | oneme
 	URL       string // yandex: адрес документа
@@ -129,9 +88,7 @@ type openFluxLink struct {
 	Name      string // фрагмент ссылки — имя для карточки конфига
 }
 
-// parseOpenFluxLink — ЕДИНЫЙ декодер ссылки: его зовут и коннект-путь, и `summarize`, и
-// `normalize`. Второго парсера у модуля быть не должно — разойдутся на первой же правке
-// грамматики, и карточка начнёт показывать не тот сервер, к которому идёт подключение.
+// parseOpenFluxLink is the single link decoder shared by the connect path, summarize, and normalize.
 func parseOpenFluxLink(raw string) (openFluxLink, error) {
 	var l openFluxLink
 	s := strings.TrimSpace(raw)
@@ -150,10 +107,7 @@ func parseOpenFluxLink(raw string) (openFluxLink, error) {
 	l.Name = strings.TrimSpace(u.Fragment)
 	q := u.Query()
 
-	// openflux-server's own deep-link shape - see decodeImportLink's doc
-	// comment. Unwraps to the same {Transport, URL, Name} shape the plain
-	// yandex/oneme forms below produce, so everything past this point
-	// (server(), displayName(), the connect path) treats it identically.
+	// The import form unwraps to the same {Transport, URL, Name} shape the plain yandex/oneme forms produce.
 	if host == linkHostImport {
 		tr, docURL, name, derr := decodeImportLink(q)
 		if derr != nil {
@@ -193,10 +147,7 @@ func parseOpenFluxLink(raw string) (openFluxLink, error) {
 	return l, nil
 }
 
-// decodeImportLink parses openflux-server's deep-link payload (header comment
-// above has the JSON shape). Never dials control_url — same reason the fork's
-// own Android app doesn't: that request would hit a bare IP with none of the
-// tunnel's disguise.
+// decodeImportLink never dials control_url - that request would hit a bare IP with none of the tunnel's disguise.
 func decodeImportLink(q url.Values) (transportName, docURL, name string, err error) {
 	raw, derr := base64.RawURLEncoding.DecodeString(q.Get("data"))
 	if derr != nil {
@@ -226,9 +177,7 @@ func decodeImportLink(q url.Values) (transportName, docURL, name string, err err
 	return transportName, docURL, str("name"), nil
 }
 
-// server — что показать в карточке конфига как «сервер». Для yandex это хост документа, для
-// oneme — сигнальный хост MAX плюс id собеседника: два конфига одного транспорта обязаны
-// РАЗЛИЧАТЬСЯ в списке, иначе карточка врёт.
+// server is the config card's "server" field; two configs of the same transport must differ here.
 func (l openFluxLink) server() string {
 	if l.Transport == transportYandex {
 		if u, err := url.Parse(l.URL); err == nil && u.Host != "" {
@@ -249,16 +198,14 @@ func (l openFluxLink) displayName() string {
 	return "OpenFlux MAX"
 }
 
-// normalizeOpenFlux — НЕ-link формы (JSON / base64-JSON) → канонический openflux://-link
-// (MODULE_API §2.6). Уже link / чужой формат → "". Ключи JSON — те же, что параметры ссылки.
+// normalizeOpenFlux converts non-link JSON forms to a canonical openflux://-link (MODULE_API §2.6).
 func normalizeOpenFlux(raw string) string {
 	s := strings.TrimSpace(raw)
 	if s == "" || strings.HasPrefix(strings.ToLower(s), linkScheme+"://") {
 		return ""
 	}
 	if !strings.HasPrefix(s, "{") {
-		return "" // base64-обёртку не принимаем: у формата нет собственного признака, и любой
-		// base64-текст соседнего модуля мы бы «узнали» как свой.
+		return "" // no base64 wrapper support - the format has no signature to tell it apart from another module's data
 	}
 	var m map[string]any
 	if json.Unmarshal([]byte(s), &m) != nil {
@@ -298,16 +245,13 @@ func normalizeOpenFlux(raw string) string {
 	return link
 }
 
-// moduleCall — parse-only сабкоманды (MODULE_API §2.2). Канон `shared/entry` зовёт её из argv на
-// десктопе и из `antinet_module_call` в Android-слоте — тело одно.
-// `canping` не объявлен: `pingNeedsConsent` в дескрипторе нет, интерактива у модуля тоже, и хост
-// эту сабкоманду не спрашивает.
+// moduleCall handles parse-only subcommands (MODULE_API §2.2); shared by argv (desktop) and antinet_module_call (Android).
 func moduleCall(verb, arg string) string {
 	switch verb {
 	case "summarize":
 		l, err := parseOpenFluxLink(arg)
 		if err != nil {
-			return "\n" // чужая схема/битая ссылка — две пустые строки, хост оставит плейсхолдер
+			return "\n" // bad/foreign link - host keeps the placeholder
 		}
 		return l.displayName() + "\n" + l.server()
 	case "normalize":
@@ -321,8 +265,7 @@ func moduleCall(verb, arg string) string {
 func realMain(configContent, resolversPath, profileDir, protectPath string, listenFd int) int {
 	_ = resolversPath // OpenFlux не использует: его транспорт настраивается ссылкой целиком
 
-	// Канал событий хоста — САМЫМ ПЕРВЫМ (десктоп: построчный stdin; Android-слот: no-op, там хост
-	// зовёт antinet_module_event напрямую). Канон shared/lifecycle.
+	// Host event channel must start first (desktop: line-based stdin; Android: no-op).
 	startHostEventReader()
 	dieWithParent()
 	protectFromOomKill()
@@ -340,8 +283,7 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 
 	link, err := parseOpenFluxLink(cfg["LINK"])
 	if err != nil {
-		// Причина неподъёма обязана уйти хосту ЯВНО (`LOG|` виден юзеру, `STATUS|` — вход решения
-		// хоста), иначе наружу пойдёт только «модуль не запустился».
+		// The failure reason must reach the host explicitly via LOG|/STATUS|, not just "module failed to start".
 		emitLog(s.badLinkFmt, err)
 		emitStatus(statusFatal, "bad link")
 		log.Fatalf("parse LINK: %v", err)
@@ -350,15 +292,10 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	dialTimeout := settingDuration(cfg, "SETTING_dialTimeoutSec", defaultDialSec)
 	keepAlive := settingDuration(cfg, "SETTING_keepAliveSec", defaultKeepSec)
 
-	// Резолвер SOCKS5 CONNECT-таргетов — канон shared/dns: protected off-tunnel, TTL-кэш,
-	// single-flight. Домены, приходящие в SOCKS5 CONNECT, резолвятся ИМ: туннель OpenFlux несёт
-	// ТОЛЬКО TCP (см. ниже), резолвить внутри него нечего.
+	// SOCKS5 CONNECT targets resolve via this protected, TTL-cached, single-flight resolver.
 	resolver := newProtectedResolver(cfg["DNS_SERVERS"], protectPath)
 
-	// Дозвон и резолв САМОГО транспорта (документ Яндекса / сигнальный хост MAX) — глобально,
-	// package-level (transport/protect.go, дословная копия openflux-server): вендорный код внутри
-	// yandex.go/oneme больше не принимает dial параметром конструктора, а зовёт
-	// transport.ProtectedDialer()/ProtectedResolver() сам. protectFdFunc — канон shared/protect.
+	// The transport's own dial/resolve is set globally (transport/protect.go); yandex.go/oneme call it themselves.
 	transport.SetProtector(func(fd int) bool { return protectFdFunc(protectPath)(int32(fd)) })
 	if servers := hostDNSServers(cfg["DNS_SERVERS"]); len(servers) > 0 {
 		transport.SetBootstrapDNSServers(servers)
@@ -390,13 +327,9 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		log.Fatalf("transport start: %v", err)
 	}
 
-	// Ждём, пока транспорт реально встанет, и ТОЛЬКО потом отмечаем готовность: маркер `ready`
-	// означает «через меня можно ходить», а не «процесс жив». Отметить раньше — значит отдать
-	// хосту зелёный свет на сессию, которой ещё нет, и получить обрывы вместо честного ожидания
-	// (хост готов ждать до своего READY_TIMEOUT ~95с, см. §2.10).
+	// The ready marker means "traffic can flow", so it's only written after the transport actually comes up.
 	if !waitTransportUp(trans) {
-		// Чистый выход, а не зомби (§2.3 п.7): хост поднимет нас заново своим death-watchdog'ом
-		// сразу, тогда как висящий без маркера процесс он будет ждать до конца бюджета впустую.
+		// A clean exit here lets the host's death-watchdog restart us immediately instead of waiting out the full budget.
 		emitLog(s.transportNotUpFmt, readyWaitBudget)
 		emitStatus(statusFatal, "transport did not come up")
 		log.Fatalf("transport did not come up within %s", readyWaitBudget)
@@ -421,11 +354,7 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	emitStatus(statusOK, "")
 	log.Printf("openflux helper: SOCKS5 on 127.0.0.1:%d transport=%s", actualPort, link.Transport)
 
-	// Хендовер: дескриптор объявляет `handoverMode: "signal"` + `hostEvents` (все четыре причины,
-	// §2.8) — хост НЕ убивает helper на смене сети, а шлёт событие в живой процесс. Реакция —
-	// оборвать живую сессию транспорта и ничего больше: read-петля/keepalive транспорта уже умеют
-	// переподключаться сами (yandex.(*YandexDocsTransport).Handover / oneme.(*OneMeTransport).Handover),
-	// а SOCKS5-листенер и уже принятые соединения переживают паузу вместо полного перезапуска модуля.
+	// Handover (§2.8): host sends an event instead of killing the helper; the transport reconnects on its own.
 	setHostEventHandler(func(event string) {
 		switch event {
 		case "handover", "netlost", "netback", "stall":
@@ -441,8 +370,7 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	return 0
 }
 
-// settingDuration — значение настройки в секундах (MODULE_API §2.11). Непарсящееся/нулевое →
-// дефолт: хост ВСЕГДА шлёт значение, но модуль обязан пережить и пустое.
+// settingDuration reads a setting in seconds (MODULE_API §2.11), falling back to defSec if unparseable.
 func settingDuration(cfg map[string]string, key string, defSec int) time.Duration {
 	if v, err := strconv.Atoi(strings.TrimSpace(cfg[key])); err == nil && v > 0 {
 		return time.Duration(v) * time.Second
@@ -450,13 +378,7 @@ func settingDuration(cfg map[string]string, key string, defSec int) time.Duratio
 	return time.Duration(defSec) * time.Second
 }
 
-// waitTransportUp — ограниченное ожидание готовности транспорта. Потолок — ЧУТЬ МЕНЬШЕ хостового
-// READY_TIMEOUT (~95с): дождаться собственного дедлайна и выйти чисто лучше, чем быть убитым
-// снаружи, потому что чистый выход хост лечит немедленным перезапуском.
-//
-// ⚠ Опрос, а не событие: у апстримного интерфейса `transport.Transport` нет канала готовности,
-// только `IsConnected()`. Заводить свой означало бы править апстримную абстракцию ради того, что
-// опрос раз в 200 мс решает без последствий.
+// waitTransportUp polls IsConnected() (transport.Transport has no readiness channel) up to just under the host's READY_TIMEOUT.
 func waitTransportUp(t transport.Transport) bool {
 	deadline := time.Now().Add(readyWaitBudget)
 	for time.Now().Before(deadline) {
@@ -468,8 +390,7 @@ func waitTransportUp(t transport.Transport) bool {
 	return t.IsConnected()
 }
 
-// handleConn — CONNECT-путь модуля. Сам протокол SOCKS5 (приветствие, user/pass, разбор запроса,
-// реле) — канон shared/socks5; модулю принадлежит только ТРАНСПОРТ: дозвон через свой туннель.
+// handleConn is the module's CONNECT path; the SOCKS5 protocol itself lives in shared/socks5.
 func handleConn(c net.Conn, user, pass string, tun *tunnel.TCPTunnel, resolver *protectedResolver, dialTimeout time.Duration) {
 	defer c.Close()
 	br := bufio.NewReader(c)
@@ -479,11 +400,7 @@ func handleConn(c net.Conn, user, pass string, tun *tunnel.TCPTunnel, resolver *
 		return
 	}
 	if req.Cmd == socksCmdUDPAssociate {
-		// UDP ASSOCIATE не поддерживаем ОСОЗНАННО, а не по недоделке: gVisor-стек туннеля
-		// регистрирует один только `tcp.NewProtocol`, а exit-node отдаёт пакеты в raw-socket TCP —
-		// произвольный UDP по этому транспорту не проходит физически. Честный `0x07` лучше, чем
-		// принятая ассоциация, из которой ничего не уходит: UDP-каскад за таким модулем не
-		// поднимется в любом случае, и различаться должны причина и диагноз (§2.3 п.6).
+		// UDP ASSOCIATE is deliberately unsupported: the tunnel's gVisor stack only registers tcp.NewProtocol.
 		_, _ = c.Write(socksRep(0x07))
 		return
 	}
@@ -495,8 +412,7 @@ func handleConn(c net.Conn, user, pass string, tun *tunnel.TCPTunnel, resolver *
 	ip, rerr := resolveV4(req, resolver)
 	if rerr != nil {
 		log.Printf("[SOCKS] resolve FAILED host=%s err=%v", host, rerr)
-		// 0x04 host unreachable, а не 0x01: адресат назван корректно, но этой семьёй адресов
-		// туннель не ходит — это «до него отсюда нет пути», а не «что-то пошло не так».
+		// 0x04 host unreachable, not 0x01: the tunnel just can't route this address family.
 		_, _ = c.Write(socksRep(0x04))
 		return
 	}
@@ -516,9 +432,7 @@ func handleConn(c net.Conn, user, pass string, tun *tunnel.TCPTunnel, resolver *
 	relayBidi(c, br, up, target, dialStart)
 }
 
-// resolveV4 — адресат как ЛИТЕРАЛЬНЫЙ IPv4. Туннель OpenFlux несёт только IPv4 (клиентский
-// netstack поднят на 10.10.10.2/24 с одним `ipv4.NewProtocol`), поэтому отбор семьи — здесь, в
-// одной точке, а не отдельно у литерала и отдельно у домена.
+// resolveV4 picks IPv4 in one place for both literal and domain targets, since the tunnel is IPv4-only.
 func resolveV4(req socksRequest, resolver *protectedResolver) (string, error) {
 	if req.IsIP() {
 		if !req.IP.Is4() && !req.IP.Is4In6() {
@@ -538,15 +452,10 @@ func resolveV4(req socksRequest, resolver *protectedResolver) (string, error) {
 	return "", fmt.Errorf("no IPv%d address for %s (got %v)", dnsQueryFamilyV4, req.Host, ips)
 }
 
-// handoverer — реакция на событие хоста (§2.8), реализована и yandex.YandexDocsTransport, и
-// oneme.OneMeTransport. Отдельный локальный интерфейс, а не метод на `transport.Transport`: тот
-// живёт в transport.go, который обязан оставаться дословной копией openflux-server (см. этого
-// файла шапку и examples/moduleopenflux/README.md) — добавлять в него что-то модульное нельзя.
+// handoverer is a local interface (not a transport.Transport method, which must stay an exact upstream copy).
 type handoverer interface{ Handover() }
 
-// hostDNSServers — DNS_SERVERS (те же bare-IP/ip:port через запятую, что читает shared/dns) для
-// transport.SetBootstrapDNSServers: транспорт резолвит СВОИ хосты (docs.yandex.ru и т.п.) через
-// физические DNS хоста, а не через захардкоженные публичные резолверы transport/protect.go.
+// hostDNSServers feeds transport.SetBootstrapDNSServers so the transport resolves its own hosts via the host's physical DNS.
 func hostDNSServers(csv string) []string {
 	var out []string
 	for _, s := range strings.Split(csv, ",") {

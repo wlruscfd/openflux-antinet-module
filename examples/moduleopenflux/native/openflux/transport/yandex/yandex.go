@@ -25,32 +25,10 @@ import (
 	"universal-bypass-tool/utils"
 )
 
-// Sending one WebSocket frame per queued packet was cheap enough for a
-// single mobile client but scales badly on an exit node juggling many keys
-// at once - every packet pays its own base64 encode, JSON string format,
-// and WriteMessage syscall regardless of size, and the OS/GC overhead of
-// that per-message cost is what actually dominates at higher concurrent
-// packet rates, not the bytes themselves. writerLoop below batches several
-// queued packets into one length-prefixed blob (the same framing Volga
-// already uses - see decodeBatch in volga.go, reused here as-is) before
-// base64-encoding and sending it as a single "cursor" message, the same way
-// Volga batches multiple packets into one relay HTTP POST.
-//
-// batchMarker prefixes a batched payload's first byte so a peer can tell it
-// apart from a lone compressed packet: compress() only ever emits 0x00
-// (stored) or 0x1F (LZ4) as its own first byte, so 0xFE never collides with
-// a real single-packet payload. That only covers RECEIVING from a mixed-
-// version peer, though - see kaBatchCapabilityToken for why sending is
-// gated separately.
+// batchMarker flags a batched payload's first byte; compress() never emits 0xFE as a lone packet's first byte, so the two can't collide.
 const batchMarker = 0xFE
 
-// kaBatchCapabilityToken rides inside the keepalive to tell a peer "my code
-// understands batchMarker" before ever sending it one. Without this, a
-// build that unconditionally batches breaks a not-yet-updated peer in
-// EITHER role - its own receive path has no batchMarker check at all, so a
-// batched frame just fails to decompress. Peer capability, not which role
-// this transport plays (client vs exit node), is what writerLoop's flush
-// gates sending on - see peerBatches.
+// kaBatchCapabilityToken tells a peer via keepalive that it understands batchMarker before we ever send one - see peerBatches.
 const kaBatchCapabilityToken = "+batch1"
 
 const (
@@ -59,25 +37,16 @@ const (
 	ydocsBatchMaxBytes = 4 * 1024 * 1024
 )
 
-// wsWriteTimeout bounds every WebSocket write - without it, a stalled write
-// blocks WriteMessage forever and writerLoop (the one goroutine draining a
-// session's queue for its whole life) wedges there permanently.
+// wsWriteTimeout bounds every WebSocket write so a stalled write can't wedge writerLoop forever.
 const wsWriteTimeout = 10 * time.Second
 
-// defaultPingWindow is used when the server's engine.io "open" packet can't
-// be parsed for its own pingInterval/pingTimeout (see performHandshake) -
-// 25s+20s matches Socket.IO's own common server-side defaults.
+// defaultPingWindow is used when the open packet's ping settings can't be parsed; matches Socket.IO's common defaults.
 const defaultPingWindow = 45 * time.Second
 
-// handshakeTimeout bounds how long connectToDoc waits for the engine.io
-// open packet and the socket.io namespace-connect ack before giving up and
-// reconnecting - see the package-level doc comment on performHandshake for
-// why this handshake has to be awaited at all.
+// handshakeTimeout bounds how long connectToDoc waits for the handshake before giving up and reconnecting.
 const handshakeTimeout = 15 * time.Second
 
-// Reason codes passed to scheduleReconnect and reported as the last field of
-// transport.EventRetrying's detail - see mobile.Callback.OnLogEvent and the
-// Android app's Logs tab for how these map to human-readable text.
+// Reason codes reported in transport.EventRetrying's detail; see the Android app's Logs tab.
 const (
 	reasonFetchFailed     = "fetch_failed"
 	reasonDialFailed      = "dial_failed"
@@ -127,31 +96,14 @@ type YandexDocsTransport struct {
 	userCounter atomic.Int32
 	baseUserID  string
 
-	// recentSent guards against processing our own data. Yandex's doc
-	// broadcasts every "cursor" event to every participant in the document,
-	// sender included - the same self-echo a collaborative editor's cursor
-	// broadcast normally is. A tunnel packet we ourselves just sent (see
-	// writerLoop) comes back over the same socket and would be reinjected as
-	// if the peer sent it - a real, correctly-formed packet just flowing in a
-	// direction gvisor's NAT/forwarding never expects on that NIC (this is
-	// what surfaces as "unexpected transport protocol = 0", not a cause of
-	// it). Recording a short-lived hash of every payload we send and
-	// skipping any inbound payload that matches catches this without needing
-	// Yandex's exact broadcast wrapping format, or touching the wire format
-	// the real backend expects.
+	// recentSent guards against reprocessing our own data: Yandex echoes every "cursor" event back to its sender too.
 	recentSentMu sync.Mutex
 	recentSent   map[uint32]time.Time
 
-	// peerBatches is learned from the peer's own keepalive (see
-	// kaBatchCapabilityToken) - only once we know the peer's code
-	// recognizes batchMarker do we send it batched frames, so a build
-	// running against a not-yet-updated peer (or vice versa) keeps using
-	// the legacy one-packet-per-message format instead of sending
-	// something the other side can't parse.
+	// peerBatches is learned from the peer's keepalive (kaBatchCapabilityToken); only then do we send it batched frames.
 	peerBatches atomic.Bool
 
-	// wakeReconnect, guarded by Mu, is non-nil exactly while scheduleReconnect
-	// is sleeping out a backoff delay between attempts - see ForceReconnect.
+	// wakeReconnect, guarded by Mu, is non-nil exactly while scheduleReconnect sleeps out a backoff delay - see ForceReconnect.
 	wakeReconnect chan struct{}
 }
 
@@ -164,17 +116,7 @@ func NewYandexDocsTransport(url string, config transport.TransportConfig) *Yande
 	return t
 }
 
-// normalizeDocURL rewrites a Yandex Disk share link into the equivalent
-// Yandex Docs URL fetchDocInfo actually knows how to fetch. A disk.yandex.ru
-// "/i/<hash>" share link and the docs.yandex.ru edit link serve the same
-// client-config-bearing page for a supported document, just under
-// different hostnames - a plain host swap is all that's needed, path and
-// query string carry over untouched. Used on both the client and the
-// exit-node side, since both run this same transport - one normalization
-// site covers whichever end of the tunnel a user pastes a disk.yandex.ru
-// link into. Anything else (a different host, a malformed URL, a
-// disk.yandex.ru path that isn't a share link) passes through unchanged
-// and is left for the actual HTTP fetch to accept or reject.
+// normalizeDocURL rewrites a disk.yandex.ru share link to the equivalent docs.yandex.ru URL fetchDocInfo expects.
 func normalizeDocURL(raw string) string {
 	u, err := neturl.Parse(raw)
 	if err != nil {
@@ -199,13 +141,7 @@ func (t *YandexDocsTransport) Start() error {
 	return nil
 }
 
-// Send queues data for the writer loop to actually put on the wire.
-// Deliberately does not require IsConnected(): a session's WriteQueue is
-// reused across a reconnect (see connectToDoc), so a brief drop just queues
-// data until the new session drains it - checking IsConnected() here would
-// make that blip visible as loss, forcing the real end-to-end TCP connection
-// several hops away to notice and retransmit on its own, much slower,
-// timeout.
+// Send doesn't require IsConnected(): WriteQueue survives a reconnect, so a brief drop just queues data instead of surfacing as loss.
 func (t *YandexDocsTransport) Send(data []byte) error {
 	t.Mu.RLock()
 	session := t.session
@@ -262,10 +198,7 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		headers.Set("Origin", info.Origin)
 		headers.Set("Cookie", info.CookieStr)
 		headers.Set("Host", info.Host)
-		// A WebSocket upgrade, not a page load - Sec-Fetch-Dest/Mode differ
-		// from applyBrowserGetHeaders' document-navigation values
-		// accordingly (real Firefox sends these for a same-origin WS
-		// connection opened from a page it just loaded).
+		// A WebSocket upgrade, not a page load, so Sec-Fetch-* differ from applyBrowserGetHeaders' values.
 		headers.Set("Sec-Fetch-Dest", "websocket")
 		headers.Set("Sec-Fetch-Mode", "websocket")
 		headers.Set("Sec-Fetch-Site", "same-origin")
@@ -277,14 +210,7 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			return
 		}
 
-		// The engine.io/socket.io handshake must complete (open packet,
-		// then our namespace-connect, then the server's connect ack)
-		// before anything else goes over this socket. Sending the auth
-		// event packet (or, worse, real tunneled data once writerLoop
-		// starts draining the queue) ahead of that ack lands it in a
-		// namespace the server hasn't confirmed yet, which is exactly what
-		// was making OnlyOffice's backend tear the connection down with
-		// close code 1005 in a loop.
+		// The handshake must complete before anything else goes over this socket - sending early got connections torn down with close code 1005.
 		readTimeout, err := t.performHandshake(conn, info.Token)
 		if err != nil {
 			utils.Debugf("[YDOCS] handshake failed: %v", err)
@@ -345,16 +271,7 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 				utils.Debugf("[YDOCS] Read error: %v", err)
 				t.SetConnected(false)
 				conn.Close()
-				// A session that stayed up for a while dropping is a normal,
-				// unremarkable blip (Yandex's own infra recycling the
-				// connection, a brief network hiccup) - not evidence the
-				// backend or network is struggling and reconnects should
-				// slow down for. Without this, attempt only ever grows
-				// across a long-lived transport's whole life, so backoff
-				// eventually settles at MaxReconnectDelay and stays there
-				// for every future reconnect, even hours later when nothing
-				// is actually wrong - a working connection ends up waiting
-				// up to 30s to come back after every routine drop.
+				// A session that stayed up a while before dropping is a normal blip, not sustained trouble, so reset backoff.
 				next := attempt
 				if time.Since(connectedAt) > 15*time.Second {
 					next = 0
@@ -367,21 +284,7 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 	}()
 }
 
-// performHandshake waits out the engine.io/socket.io connection sequence:
-//
-//  1. server -> client: engine.io "open" packet ("0{...}"), carrying the
-//     server's actual pingInterval/pingTimeout;
-//  2. client -> server: socket.io namespace-connect ("40{"token":...}"),
-//     sent only once (1) has arrived;
-//  3. server -> client: namespace-connect ack ("40{"sid":...}") or a
-//     connect-error ("44...") - only once the ack arrives is this socket
-//     actually usable for anything else.
-//
-// Engine.io pings ("2") can arrive at any point in this sequence and are
-// answered ("3") immediately regardless of handshake progress, same as in
-// steady-state. It returns the read-idle timeout to apply for the rest of
-// this connection's life (derived from the server's own ping settings so a
-// silently-dead connection is detected instead of blocking forever).
+// performHandshake waits for the engine.io open packet, sends the namespace-connect, then waits for its ack before the socket is usable.
 func (t *YandexDocsTransport) performHandshake(conn *websocket.Conn, token string) (time.Duration, error) {
 	conn.SetReadDeadline(time.Now().Add(handshakeTimeout))
 	defer conn.SetReadDeadline(time.Time{})
@@ -455,13 +358,7 @@ func (t *YandexDocsTransport) writerLoop(queue chan []byte) {
 	}
 
 	for t.IsRunning() {
-		// t.session is never nil'd on disconnect (see connectToDoc) - it
-		// keeps pointing at the old, now-dead session until a new one
-		// replaces it, so checking session/session.Conn for nil here can't
-		// detect a drop; only IsConnected() distinguishes a live session from
-		// a stale pointer. Waiting on it before touching the channel is what
-		// keeps queued data queued (and batch, if anything is held) until a
-		// live session exists to drain it into.
+		// t.session is never nil'd on disconnect, so only IsConnected() (not a nil check) tells a live session from a stale pointer.
 		t.Mu.RLock()
 		session := t.session
 		connected := t.IsConnected()
@@ -479,19 +376,13 @@ func (t *YandexDocsTransport) writerLoop(queue chan []byte) {
 				flush(session)
 			}
 		case <-time.After(ydocsBatchTimeout):
-			// Whatever's accumulated so far (even a single packet) goes
-			// out now rather than waiting for a full batch - low traffic
-			// must not turn into added latency.
+			// Flush whatever's accumulated now rather than waiting for a full batch, so low traffic doesn't add latency.
 			flush(session)
 		}
 	}
 }
 
-// sendBatch frames batch as one length-prefixed blob (batchMarker + Volga's
-// own [len,data]... encoding, reused verbatim via decodeBatch on the
-// receiving end), base64s it, and writes it as a single "cursor" message -
-// one WriteMessage syscall and one self-echo hash for however many packets
-// batch holds, instead of one of each per packet.
+// sendBatch frames batch as one length-prefixed blob and sends it as a single message instead of one per packet.
 func (t *YandexDocsTransport) sendBatch(session *DocSession, batch [][]byte) {
 	var blob bytes.Buffer
 	blob.WriteByte(batchMarker)
@@ -505,13 +396,7 @@ func (t *YandexDocsTransport) sendBatch(session *DocSession, batch [][]byte) {
 
 	t.markSent(framed)
 	if utils.IsVerbose() {
-		// framed is whatever the caller handed to Send() for each packet in
-		// batch, length-prefixed and concatenated - when wrapped in
-		// transport.CompressedTransport (the normal case), that's
-		// already-compressed bytes, not raw IP packets, so parsing it here
-		// would print convincing-looking nonsense instead of failing
-		// loudly. Byte/packet counts are the only things safe to claim
-		// about it at this layer.
+		// framed is already-compressed bytes at this layer, not raw IP packets - only byte/packet counts are safe to log here.
 		utils.Debugf("[YDOCS] -> %d bytes (%d packets)\n", len(framed), len(batch))
 	}
 
@@ -523,10 +408,7 @@ func (t *YandexDocsTransport) sendBatch(session *DocSession, batch [][]byte) {
 	}
 }
 
-// sendSingle is sendBatch without the batchMarker framing - the exact
-// one-packet-per-message format from before batching existed, used until
-// the peer's keepalive proves it understands batched frames (see
-// peerBatches).
+// sendSingle is sendBatch without batchMarker framing, used until the peer's keepalive proves it understands batched frames.
 func (t *YandexDocsTransport) sendSingle(session *DocSession, packet []byte) {
 	t.markSent(packet)
 	if utils.IsVerbose() {
@@ -541,13 +423,7 @@ func (t *YandexDocsTransport) sendSingle(session *DocSession, packet []byte) {
 	}
 }
 
-// markSent records that data was just sent, so a later self-echo of it
-// arriving back through handleMessage can be recognized and dropped - see
-// YandexDocsTransport.recentSent's doc comment. Entries expire on their own
-// (checked in wasRecentlySent) rather than needing an explicit size cap: an
-// echo either arrives within a couple of seconds or not at all, so nothing
-// legitimate is lost by letting old entries age out during opportunistic
-// cleanup here.
+// markSent records a short-lived hash of sent data so a later self-echo can be recognized and dropped.
 func (t *YandexDocsTransport) markSent(data []byte) {
 	h := crc32.ChecksumIEEE(data)
 	now := time.Now()
@@ -568,11 +444,7 @@ func (t *YandexDocsTransport) markSent(data []byte) {
 	}
 }
 
-// wasRecentlySent reports whether data matches something markSent recorded
-// within the last 5 seconds - a real echo of our own traffic always arrives
-// within one round trip to Yandex's servers, far under that window, while an
-// unrelated packet from the peer coincidentally producing the same CRC32 is
-// astronomically unlikely.
+// wasRecentlySent reports whether data was sent within the last 5s - a real echo always arrives far under that window.
 func (t *YandexDocsTransport) wasRecentlySent(data []byte) bool {
 	h := crc32.ChecksumIEEE(data)
 
@@ -586,10 +458,7 @@ func (t *YandexDocsTransport) wasRecentlySent(data []byte) bool {
 func (t *YandexDocsTransport) keepAliveLoop() {
 	ticker := time.NewTicker(t.GetConfig().KeepAliveInterval)
 	defer ticker.Stop()
-	// The trailing token rides inside the existing "---KA---" keepalive
-	// (still an exact substring, so a not-yet-updated peer's own
-	// strings.Contains(text, "---KA---") still matches and ignores it same
-	// as always) - see peerBatches and kaBatchCapabilityToken.
+	// The capability token rides inside the existing "---KA---" keepalive so a stale peer's substring match still ignores it.
 	keepAliveMsg := `42["message",{"type":"cursor","cursor":"18;---KA---` + kaBatchCapabilityToken + `"}]`
 
 	for t.IsRunning() {
@@ -602,10 +471,7 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 			if err := session.safeWrite(websocket.TextMessage, []byte(keepAliveMsg)); err != nil {
 				utils.Debugf("[YDOCS] Keep-alive failed: %v", err)
 				t.SetConnected(false)
-				// Force the blocked ReadMessage() in this session's read
-				// loop to return immediately instead of waiting out the
-				// full read-deadline window, so reconnection starts right
-				// away rather than up to defaultPingWindow later.
+				// Force the blocked read to return now instead of waiting out the full read-deadline window.
 				session.Conn.Close()
 			}
 		}
@@ -622,7 +488,7 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 		return
 	}
 
-	// Socket.IO ping - respond with pong (use safeWrite)
+	// Socket.IO ping - respond with pong
 	if text == "2" {
 		if session != nil && session.Conn != nil {
 			session.safeWrite(websocket.TextMessage, []byte("3"))
@@ -645,11 +511,7 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 			return
 		}
 
-		// The doc broadcasts every cursor event to every participant,
-		// sender included - without this check our own just-sent packet
-		// comes back here as if the peer had sent it. See recentSent's
-		// doc comment on YandexDocsTransport for why this bit us badly:
-		// it isn't a rare glitch, it's every single packet we send.
+		// The doc broadcasts every cursor event back to its sender too, so our own just-sent packet would otherwise loop back here.
 		if t.wasRecentlySent(decoded) {
 			if utils.IsVerbose() {
 				utils.Debugf("[YDOCS] dropped self-echo (%d bytes)\n", len(decoded))
@@ -658,18 +520,12 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 		}
 
 		if utils.IsVerbose() {
-			// Same caveat as writerLoop's "-> N bytes" line: decoded is
-			// still pre-decompression at this layer, not a raw IP packet.
 			utils.Debugf("[YDOCS] <- %d bytes\n", len(decoded))
 		}
 
 		t.RecordReceive(len(decoded))
 
-		// batchMarker (see sendBatch) flags decoded as several
-		// length-prefixed packets rather than one lone payload - the
-		// framing a not-yet-updated peer's packets never carry (compress()
-		// only ever emits 0x00/0x1F as its own first byte), so this stays
-		// correct talking to either version of this transport.
+		// batchMarker flags decoded as several length-prefixed packets rather than one lone payload.
 		if len(decoded) > 0 && decoded[0] == batchMarker {
 			for _, pkt := range decodeBatch(decoded[1:]) {
 				t.CallReceive(pkt)
@@ -702,14 +558,7 @@ func (t *YandexDocsTransport) extractBase64String(response string) string {
 	return ""
 }
 
-// scheduleReconnect waits out an exponential backoff (see
-// transport.DefaultConfig's ReconnectDelay/ReconnectMultiplier/
-// MaxReconnectDelay) before retrying, instead of hammering the server in a
-// tight loop every time a connection attempt fails fast. cause is the
-// actual error that triggered this retry - reasonCode alone only tells a
-// human-facing log which of a handful of fixed categories it falls into
-// ("couldn't reach the document"), not what specifically went wrong; cause
-// is carried in the same event for a caller that wants to show both.
+// scheduleReconnect waits out an exponential backoff before retrying instead of hammering the server on every failed attempt.
 func (t *YandexDocsTransport) scheduleReconnect(attempt int, reasonCode string, cause error) {
 	if !t.IsRunning() || attempt >= t.GetConfig().MaxReconnectAttempts {
 		return
@@ -721,11 +570,7 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int, reasonCode string, 
 	causeText := strings.ReplaceAll(cause.Error(), "\n", " ")
 	t.EmitEvent(transport.EventRetrying, fmt.Sprintf("%d|%d|%s|%s", attempt+1, int(delay.Seconds()), reasonCode, causeText))
 	if delay > 0 {
-		// wake lets ForceReconnect cut this short - published under Mu so a
-		// concurrent ForceReconnect either sees it (and closes it, ending
-		// the select below immediately) or arrives too early/late to matter
-		// (nothing to interrupt in either case, same as before this field
-		// existed).
+		// wake lets ForceReconnect cut this short; published under Mu so a concurrent call can't race it.
 		wake := make(chan struct{})
 		t.Mu.Lock()
 		t.wakeReconnect = wake
@@ -750,28 +595,10 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int, reasonCode string, 
 	t.connectToDoc(attempt + 1)
 }
 
-// ForceReconnect makes the transport retry right now: drops a live
-// connection so its read loop notices and redials through the usual
-// scheduleReconnect path, or, if no connection is up and it's instead
-// sleeping out a backoff delay between attempts, cuts that wait short. A
-// no-op if neither applies (not started yet, or already mid-attempt past
-// the wait).
-//
-// Why this exists at all: a network change (Wi-Fi to mobile data, or back)
-// often leaves the old socket silently dead rather than reset - nothing
-// tells this transport's read loop the connection is gone until a read
-// finally times out, which can take far longer than the backoff delay this
-// skips. A caller that already knows the network changed (a mobile OS
-// callback, an AntiNet-style host event) can report that here instead of
-// waiting for TCP to notice on its own.
+// ForceReconnect retries now: drops a live connection to redial, or cuts short a backoff sleep if one is in progress.
 func (t *YandexDocsTransport) ForceReconnect() {
 	t.Mu.Lock()
 	session := t.session
-	// t.session is never nil'd on disconnect (see connectToDoc/writerLoop's
-	// comment on the same fact) - it keeps pointing at the last session,
-	// live or not, so session != nil alone can't tell "connected right now"
-	// apart from "sleeping out a backoff with a stale session left over".
-	// IsConnected() is the field that actually tracks that distinction.
 	live := t.IsConnected()
 	wake := t.wakeReconnect
 	t.wakeReconnect = nil // claimed here, under the same lock, so a second concurrent call can't double-close wake below
@@ -799,16 +626,7 @@ func (t *YandexDocsTransport) backoffDelay(attempt int) time.Duration {
 	}
 
 	delay := float64(cfg.ReconnectDelay) * math.Pow(multiplier, float64(attempt))
-	// +0-50% jitter, applied before the cap so MaxReconnectDelay stays a
-	// true ceiling: every reconnect dials a brand new WebSocket, which
-	// Yandex's own doc-collab backend registers as a brand new participant
-	// in the room regardless of client-side user-id reuse (ported from
-	// upstream p1neappleXpress/OpenFlux, which found this live - "ghost"
-	// participants piling up across a failure streak, logged from the
-	// server's own participant-list messages). Without jitter, many clients
-	// losing the same document at once (a network-wide blip, an exit-node
-	// restart) would retry in lockstep at identical delays instead of
-	// spreading out.
+	// +0-50% jitter, applied before the cap, so many clients failing at once don't retry in lockstep.
 	delay += delay * 0.5 * rand.Float64()
 	if cfg.MaxReconnectDelay > 0 && delay > float64(cfg.MaxReconnectDelay) {
 		delay = float64(cfg.MaxReconnectDelay)
@@ -844,12 +662,7 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 	re := regexp.MustCompile(`<script[^>]*id="client-config"[^>]*>(.*?)</script>`)
 	matches := re.FindStringSubmatch(html)
 	if len(matches) < 2 {
-		// Without this, "config not found" was a dead end - no way to tell
-		// a CAPTCHA page apart from a login redirect, a maintenance page,
-		// or something else entirely without reproducing it by hand.
-		// SmartCaptcha/showcaptcha/checkbox-captcha are the markers Yandex's
-		// own bot-check pages actually use, so this is flagged explicitly
-		// rather than left for someone reading the preview to notice.
+		// Flag CAPTCHA pages explicitly so they're not mistaken for a login redirect or other failure.
 		lower := strings.ToLower(html)
 		if strings.Contains(lower, "captcha") {
 			utils.Debugf("[YDOCS] response looks like a CAPTCHA/bot-check page, not the doc editor")
@@ -867,12 +680,7 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 		return YandexDocsInfo{}, fmt.Errorf("parse client-config: %w", err)
 	}
 
-	// Every lookup below is checked rather than a bare type assertion
-	// (config["x"].(T)) - this runs in a goroutine with no recover(), so a
-	// panic here would crash the entire process the moment Yandex serves a
-	// page shaped even slightly differently than expected (an
-	// error/maintenance page, an A/B-tested layout, a partly-loaded
-	// response).
+	// Every lookup below is checked, not a bare type assertion - this runs in a goroutine with no recover().
 	officeAction, ok := config["officeActionData"].(map[string]interface{})
 	if !ok {
 		utils.Debugf("[YDOCS] config top-level keys: %v", mapKeys(config))
@@ -887,17 +695,7 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 
 	balancerURL, ok := officeAction["balancer_url"].(string)
 	if !ok {
-		// Confirmed in production: this exact signature (officeActionData +
-		// editor_config both present, only balancer_url missing - not a
-		// captcha or error page, which would fail the "config not found"
-		// check above instead) is what a newer-generation Yandex document
-		// looks like to this transport. This transport (the classic
-		// engine.io/socket.io editor session docs.yandex.ru serves) doesn't
-		// know how to talk to those; YandexVolgaTransport does (a different
-		// auth flow entirely - see volga.go's authorize()). There's no way
-		// to tell a document is this type before hitting this error - it's
-		// specific to the individual doc, not the URL shape - so the best
-		// this can do is name the actual fix instead of a bare parse error.
+		// balancer_url missing (but officeActionData/editor_config present) means a newer Yandex Docs type this transport can't handle.
 		utils.Debugf("[YDOCS] officeActionData keys: %v, editor_config keys: %v", mapKeys(officeAction), mapKeys(editorConfigRaw))
 		return YandexDocsInfo{}, fmt.Errorf("balancer_url missing - this document looks like a newer Yandex Docs type this transport doesn't support; try the Volga transport for this doc_url instead")
 	}

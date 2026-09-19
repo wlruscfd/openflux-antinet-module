@@ -20,9 +20,7 @@ func EnableDebug() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
 }
 
-// SetVerbose is EnableDebug but reversible - used where a caller (mobile.go)
-// needs to turn logging on or off per session rather than for the process's
-// whole life.
+// SetVerbose is EnableDebug but reversible, for turning logging on/off per session rather than for the process's life.
 func SetVerbose(enabled bool) {
 	verbose = enabled
 	if enabled && debugLog == nil {
@@ -30,8 +28,7 @@ func SetVerbose(enabled bool) {
 	}
 }
 
-// SetLogSink additionally forwards every Debugf line to fn (e.g. to a
-// mobile.Callback), on top of the normal stderr output. nil clears it.
+// SetLogSink additionally forwards every Debugf line to fn on top of the normal stderr output; nil clears it.
 func SetLogSink(fn func(string)) {
 	sinkMu.Lock()
 	sink = fn

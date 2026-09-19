@@ -19,20 +19,11 @@ import (
 
 // --- Send ---------------------------------------------------------------
 
-// TestSendQueuesEvenWhileDisconnected guards a real bug: Send used to
-// reject with "transport not connected" for the entire window between a
-// drop and the next successful reconnect, even though the session's
-// WriteQueue survives a reconnect specifically so queued data doesn't have
-// to be lost (see connectToDoc's existingSession handling and Send's own
-// doc comment). A disconnected transport with no session at all must still
-// fail - only "has a session, but IsConnected() is momentarily false"
-// should succeed.
+// TestSendQueuesEvenWhileDisconnected guards a real bug: Send used to reject during a reconnect even though WriteQueue survives it.
 func TestSendQueuesEvenWhileDisconnected(t *testing.T) {
 	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
 	tr.session = &DocSession{WriteQueue: make(chan []byte, 4)}
-	// Deliberately not calling tr.SetConnected(true) - this is the state
-	// during a reconnect: a (possibly stale) session exists, but the
-	// transport doesn't consider itself connected right now.
+	// Deliberately not calling tr.SetConnected(true) - this is the state during a reconnect.
 
 	if err := tr.Send([]byte("hello")); err != nil {
 		t.Fatalf("Send while disconnected but with a session = %v, want nil", err)
@@ -57,15 +48,7 @@ func TestSendFailsWithNoSessionAtAll(t *testing.T) {
 
 // --- self-echo filtering -------------------------------------------------
 
-// TestHandleMessageDropsOwnEcho guards the real production bug behind
-// "unexpected transport protocol = 0": Yandex's doc broadcasts every
-// "cursor" event to every participant, sender included, so a packet this
-// transport itself just sent (via writerLoop, which calls markSent) comes
-// straight back over the same socket. Before wasRecentlySent existed,
-// handleMessage handed that to CallReceive indistinguishably from real
-// peer data, reinjecting our own outgoing traffic into our own tunnel
-// endpoint - a well-formed packet flowing in a direction the gvisor
-// NAT/forwarding on that NIC never expects.
+// TestHandleMessageDropsOwnEcho guards against Yandex's doc broadcasting our own just-sent packet back to us as if from a peer.
 func TestHandleMessageDropsOwnEcho(t *testing.T) {
 	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
 
@@ -84,9 +67,7 @@ func TestHandleMessageDropsOwnEcho(t *testing.T) {
 	}
 }
 
-// TestHandleMessageDeliversRealPeerData is TestHandleMessageDropsOwnEcho's
-// counterpart: data this transport never sent must still reach CallReceive
-// - the echo filter must not swallow everything indiscriminately.
+// TestHandleMessageDeliversRealPeerData guards that the echo filter doesn't swallow genuine peer data too.
 func TestHandleMessageDeliversRealPeerData(t *testing.T) {
 	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
 
@@ -121,10 +102,7 @@ func buildBatch(t *testing.T, packets ...[]byte) []byte {
 	return blob.Bytes()
 }
 
-// TestHandleMessageUnbatchesMultiPacketPayload guards the new wire format
-// writerLoop/sendBatch produce: several packets length-prefixed together
-// behind a leading batchMarker byte, so one WS message can carry many
-// packets instead of exactly one.
+// TestHandleMessageUnbatchesMultiPacketPayload guards the batched wire format: several packets carried in one WS message.
 func TestHandleMessageUnbatchesMultiPacketPayload(t *testing.T) {
 	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
 
@@ -141,18 +119,14 @@ func TestHandleMessageUnbatchesMultiPacketPayload(t *testing.T) {
 	}
 }
 
-// TestHandleMessageStillHandlesUnbatchedLegacyPayload guards backward
-// compatibility with a peer that hasn't picked up batching yet (or a
-// still-running exit node mid-redeploy): a payload with no batchMarker
-// byte - exactly what compress() always produced before batching existed -
-// must still be delivered as a single packet, unsplit.
+// TestHandleMessageStillHandlesUnbatchedLegacyPayload guards backward compatibility with a peer that hasn't picked up batching yet.
 func TestHandleMessageStillHandlesUnbatchedLegacyPayload(t *testing.T) {
 	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
 
 	var received [][]byte
 	tr.Receive(func(data []byte) { received = append(received, data) })
 
-	legacy := []byte{0x00, 'h', 'i'} // compress()'s own "stored" marker, not batchMarker
+	legacy := []byte{0x00, 'h', 'i'} // stored marker, not batchMarker
 	msg := `42["message",{"type":"cursor","cursor":"18;` + b64(legacy) + `"}]`
 	tr.handleMessage(nil, []byte(msg))
 
@@ -161,10 +135,7 @@ func TestHandleMessageStillHandlesUnbatchedLegacyPayload(t *testing.T) {
 	}
 }
 
-// TestHandleMessageDropsOwnEchoedBatch is TestHandleMessageDropsOwnEcho's
-// batching-era counterpart: self-echo dedup has to hash the whole framed
-// batch sendBatch actually put on the wire, not the individual packets
-// inside it.
+// TestHandleMessageDropsOwnEchoedBatch guards that self-echo dedup hashes the whole framed batch, not the individual packets.
 func TestHandleMessageDropsOwnEchoedBatch(t *testing.T) {
 	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
 
@@ -182,9 +153,7 @@ func TestHandleMessageDropsOwnEchoedBatch(t *testing.T) {
 	}
 }
 
-// TestWriterLoopBatchesMultiplePacketsIntoOneMessage guards the actual
-// throughput win batching exists for: several packets queued in quick
-// succession must go out as one WS message, not one per packet.
+// TestWriterLoopBatchesMultiplePacketsIntoOneMessage guards that several quickly-queued packets go out as one WS message.
 func TestWriterLoopBatchesMultiplePacketsIntoOneMessage(t *testing.T) {
 	received := make(chan []byte, 1)
 	srv := serveHandshakeServer(t, func(conn *websocket.Conn) {
@@ -204,8 +173,7 @@ func TestWriterLoopBatchesMultiplePacketsIntoOneMessage(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	tr.SetConnected(true)
-	// Batching only ever turns on once the peer's own keepalive has proven
-	// it understands batchMarker - see peerBatches.
+	// Batching only turns on once the peer's keepalive has proven it understands batchMarker.
 	tr.peerBatches.Store(true)
 	queue := make(chan []byte, 10)
 	tr.session = &DocSession{Conn: conn, WriteQueue: queue}
@@ -244,10 +212,7 @@ func TestWriterLoopBatchesMultiplePacketsIntoOneMessage(t *testing.T) {
 	}
 }
 
-// TestWriterLoopDoesNotBatchByDefault guards the actual compatibility fix:
-// without proof the peer understands batchMarker, packets must go out one
-// per message in the pre-batching format, or a not-yet-updated peer (in
-// either role) can't parse them at all.
+// TestWriterLoopDoesNotBatchByDefault guards that without proof the peer understands batchMarker, packets go out one per message.
 func TestWriterLoopDoesNotBatchByDefault(t *testing.T) {
 	received := make(chan []byte, 10)
 	srv := serveHandshakeServer(t, func(conn *websocket.Conn) {
@@ -299,10 +264,7 @@ func TestWriterLoopDoesNotBatchByDefault(t *testing.T) {
 	}
 }
 
-// TestHandleMessageLearnsPeerBatchingFromKeepalive is the other half of the
-// fix: a keepalive carrying kaBatchCapabilityToken must set peerBatches,
-// while a legacy "---KA---" with nothing extra (what a not-yet-updated peer
-// actually sends) must not.
+// TestHandleMessageLearnsPeerBatchingFromKeepalive guards that only a keepalive carrying kaBatchCapabilityToken sets peerBatches.
 func TestHandleMessageLearnsPeerBatchingFromKeepalive(t *testing.T) {
 	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
 
@@ -319,12 +281,7 @@ func TestHandleMessageLearnsPeerBatchingFromKeepalive(t *testing.T) {
 
 // --- normalizeDocURL -------------------------------------------------
 
-// TestNormalizeDocURLRewritesDiskShareLinks guards the actual feature this
-// function exists for: disk.yandex.ru/i/<hash> share links (what a user
-// gets from Yandex Disk's own "share" button) and docs.yandex.ru edit links
-// serve the same client-config-bearing page for a supported document under
-// different hostnames - fetchDocInfo only knows how to ask docs.yandex.ru,
-// so a share link must be rewritten before it ever reaches an HTTP request.
+// TestNormalizeDocURLRewritesDiskShareLinks guards that a disk.yandex.ru share link is rewritten before it reaches an HTTP request.
 func TestNormalizeDocURLRewritesDiskShareLinks(t *testing.T) {
 	cases := map[string]string{
 		"https://disk.yandex.ru/i/AbCdEfGh123":         "https://docs.yandex.ru/i/AbCdEfGh123",
@@ -332,8 +289,7 @@ func TestNormalizeDocURLRewritesDiskShareLinks(t *testing.T) {
 		"https://DISK.YANDEX.RU/i/CaseInsensitiveHost": "https://docs.yandex.ru/i/CaseInsensitiveHost",
 		// Already a docs.yandex.ru link - must pass through byte-for-byte.
 		"https://docs.yandex.ru/docs/edit?url=abc": "https://docs.yandex.ru/docs/edit?url=abc",
-		// A disk.yandex.ru path that isn't a /i/ share link - left alone
-		// for the actual HTTP fetch to accept or reject, not guessed at.
+		// A disk.yandex.ru path that isn't a /i/ share link - left alone.
 		"https://disk.yandex.ru/d/FolderShareLink": "https://disk.yandex.ru/d/FolderShareLink",
 		// Malformed - returned unchanged rather than dropped.
 		"not a url at all": "not a url at all",
@@ -361,9 +317,7 @@ func TestBackoffDelayGrowsAndCaps(t *testing.T) {
 		MaxReconnectDelay:   1 * time.Second,
 	})
 
-	// backoffDelay adds up to +50% jitter (see its doc comment), so each
-	// uncapped value is checked as a range [base, base*1.5] rather than an
-	// exact figure.
+	// backoffDelay adds up to +50% jitter, so each uncapped value is checked as a range rather than an exact figure.
 	assertInJitterRange(t, tr.backoffDelay(0), 100*time.Millisecond)
 	assertInJitterRange(t, tr.backoffDelay(1), 200*time.Millisecond)
 	assertInJitterRange(t, tr.backoffDelay(2), 400*time.Millisecond)
@@ -403,8 +357,7 @@ func TestScheduleReconnectEmitsRetryingEvent(t *testing.T) {
 	var gotCode, gotDetail string
 	tr.SetEventCallback(func(code, detail string) {
 		gotCode, gotDetail = code, detail
-		// Stop the transport so scheduleReconnect's post-sleep IsRunning
-		// check bails out instead of actually redialing unused.invalid.
+		// Stop the transport so scheduleReconnect's post-sleep check bails out instead of redialing.
 		tr.Stop()
 	})
 
@@ -536,10 +489,7 @@ func TestFetchDocInfoValidConfig(t *testing.T) {
 		t.Errorf("WsURL = %q, want it to contain the doc key", info.WsURL)
 	}
 
-	// Guards the actual production issue this is fixing: a request that
-	// sets only User-Agent (and a bare, incomplete one at that) isn't a
-	// shape any real browser produces - itself a bot-detection signal
-	// independent of the requesting IP's own reputation.
+	// A request with only a bare User-Agent isn't a shape any real browser produces - itself a bot-detection signal.
 	if ua := gotHeaders.Get("User-Agent"); ua != browserUserAgent {
 		t.Errorf("User-Agent = %q, want %q", ua, browserUserAgent)
 	}
@@ -555,9 +505,7 @@ func TestFetchDocInfoValidConfig(t *testing.T) {
 
 var upgrader = websocket.Upgrader{}
 
-// serveHandshakeServer spins up a real WS server playing the
-// Yandex/OnlyOffice side of the engine.io/socket.io handshake; respond
-// drives what it sends/expects for a given test.
+// serveHandshakeServer spins up a real WS server playing the Yandex side of the handshake; respond drives each test's script.
 func serveHandshakeServer(t *testing.T, respond func(conn *websocket.Conn)) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -586,12 +534,10 @@ func TestPerformHandshakeSuccessWaitsForAck(t *testing.T) {
 	ackSentAfterConnect := make(chan struct{}, 1)
 
 	srv := serveHandshakeServer(t, func(conn *websocket.Conn) {
-		// 1. engine.io open packet, with explicit ping settings.
 		open, _ := json.Marshal(map[string]int{"pingInterval": 25000, "pingTimeout": 5000})
 		conn.WriteMessage(websocket.TextMessage, append([]byte("0"), open...))
 
-		// 2. Must receive the namespace-connect BEFORE sending the ack -
-		// this is exactly the ordering the original bug violated.
+		// Must receive the namespace-connect before sending the ack - the ordering the original bug violated.
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			t.Errorf("server read: %v", err)
@@ -612,8 +558,7 @@ func TestPerformHandshakeSuccessWaitsForAck(t *testing.T) {
 			t.Errorf("namespace-connect token = %q, want %q", payload.Token, token)
 		}
 
-		// A mid-handshake ping - the client must answer it without
-		// mistaking it for the ack and without giving up.
+		// A mid-handshake ping - the client must answer it without mistaking it for the ack.
 		conn.WriteMessage(websocket.TextMessage, []byte("2"))
 		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		_, pong, err := conn.ReadMessage()
@@ -621,7 +566,6 @@ func TestPerformHandshakeSuccessWaitsForAck(t *testing.T) {
 			t.Errorf("expected a pong (%q) in response to the mid-handshake ping, got %q, err=%v", "3", pong, err)
 		}
 
-		// 3. Only now send the ack.
 		close(ackSentAfterConnect)
 		conn.WriteMessage(websocket.TextMessage, []byte(`40{"sid":"server-sid"}`))
 
@@ -669,9 +613,7 @@ func TestPerformHandshakeFailsOnConnectError(t *testing.T) {
 }
 
 func TestPerformHandshakeDoesNotSendConnectBeforeOpen(t *testing.T) {
-	// If the client sent its namespace-connect before the server's open
-	// packet arrived, this handler would see it as the very first frame
-	// and fail the test - reproducing the original race directly.
+	// If the client sent its namespace-connect before the open packet arrived, this handler would see it first.
 	srv := serveHandshakeServer(t, func(conn *websocket.Conn) {
 		conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 		if _, _, err := conn.ReadMessage(); err == nil {
