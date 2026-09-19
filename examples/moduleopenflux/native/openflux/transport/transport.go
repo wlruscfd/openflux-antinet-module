@@ -23,18 +23,14 @@ type Transport interface {
 	IsConnected() bool
 	Stats() TransportStats
 	SetEventCallback(fn func(code, detail string))
-	// ForceReconnect makes the transport retry right now instead of waiting out its current backoff; a no-op is valid.
+	// ForceReconnect lets a caller that already knows the connection is dead (a network-change callback) trigger an immediate retry instead of waiting for read/write to notice.
 	ForceReconnect()
 }
 
-// Event codes reported via SetEventCallback/EmitEvent for a human-facing connection log.
 const (
-	// EventConnecting fires once per connection attempt, before it starts; detail is the 1-based attempt number.
 	EventConnecting = "connecting"
-	// EventConnected fires once a connection attempt succeeds; detail is the 1-based attempt number that succeeded.
-	EventConnected = "connected"
-	// EventRetrying's detail is "<failed attempt>|<delay seconds>|<reason code>|<cause>".
-	EventRetrying = "retrying"
+	EventConnected  = "connected"
+	EventRetrying   = "retrying"
 )
 
 type TransportStats struct {
@@ -50,11 +46,12 @@ type TransportStats struct {
 func DefaultConfig() TransportConfig {
 	return TransportConfig{
 		MaxReconnectAttempts: 999999,
-		ReconnectDelay:       500 * time.Millisecond,
-		ReconnectMultiplier:  1.6,
-		MaxReconnectDelay:    30 * time.Second,
-		MaxQueueSize:         1024,
-		KeepAliveInterval:    10 * time.Second,
+		// Must stay nonzero: 0 makes the exponential backoff a permanent no-op, since 0 * anything is still 0.
+		ReconnectDelay:      500 * time.Millisecond,
+		ReconnectMultiplier: 1.6,
+		MaxReconnectDelay:   30 * time.Second,
+		MaxQueueSize:        1024,
+		KeepAliveInterval:   10 * time.Second,
 	}
 }
 
@@ -122,14 +119,12 @@ func (b *BaseTransport) CallReceive(data []byte) {
 	}
 }
 
-// SetEventCallback is not safe to change once a transport has started emitting - callers set it once, after construction.
 func (b *BaseTransport) SetEventCallback(fn func(code, detail string)) {
 	b.Mu.Lock()
 	defer b.Mu.Unlock()
 	b.eventCallback = fn
 }
 
-// EmitEvent reports one event to whatever SetEventCallback registered; a no-op with none set.
 func (b *BaseTransport) EmitEvent(code, detail string) {
 	b.Mu.RLock()
 	fn := b.eventCallback
@@ -174,5 +169,4 @@ func (b *BaseTransport) GetConfig() TransportConfig {
 	return b.config
 }
 
-// ForceReconnect is the default no-op; yandex.YandexDocsTransport overrides it with a real implementation.
 func (b *BaseTransport) ForceReconnect() {}

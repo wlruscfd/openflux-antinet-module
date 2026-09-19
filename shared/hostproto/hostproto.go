@@ -75,6 +75,12 @@ func parseConfig(content string) map[string]string {
 			out[strings.TrimSpace(line[:i])] = strings.TrimSpace(line[i+1:])
 		}
 	}
+	// Резолверы, присланные хостом, канон забирает САМ (shared/dns) — на Android это единственный
+	// способ узнать, чем резолвит система, и требовать вызова от модуля значило бы раздать
+	// обязанность, за невыполнение которой платят не сборкой, а молчаливой потерей фоллбэка.
+	// Здесь, а не у вызывающего: это ЕДИНСТВЕННАЯ дверь, через которую конфиг хоста входит в
+	// процесс, — её проходят и desktop-argv, и android-C-ABI.
+	rememberHostDNSServers(out["DNS_SERVERS"])
 	return out
 }
 
@@ -123,7 +129,67 @@ func openListener(port, listenFd int) (net.Listener, error) {
 // всегда: первые разбирает хост, вторые читает разработчик грепом по helper.stdout.log, а
 // grep-тулинг ломается на не-ASCII.
 
+// stringsForLang — выбор языковой таблицы по `APP_LANG` (§2.3/§2.9). Возвращает `ru` для русского,
+// `en` для всего остального — включая пустое и неизвестное значение.
+//
+// ⛔ ЗАЧЕМ В КАНОНЕ. Решение «какой язык» принимает ХОСТ и присылает его ключом `APP_LANG`, значит
+// и трактовка этого ключа принадлежит канону, а не каждому модулю. Копий было четыре — по одной
+// на модуль (`demoStringsFor`, `mdStringsFor`, `ofStringsFor`, `qwdttStringsFor`), и все четыре
+// содержали одно и то же сравнение. Различался только ТИП таблицы, поэтому здесь он параметр:
+// набор строк у каждого модуля свой, а правило выбора — общее. Добавится третий язык — правится
+// эта функция, а не четыре дерева.
+//
+// Своё имя обёртки модуль сохраняет (`demoStringsFor` и прочие остаются): оно читается на месте
+// вызова лучше generic'а, а тело у него теперь в одну строку.
+func stringsForLang[T any](lang string, ru, en T) T {
+	if strings.EqualFold(strings.TrimSpace(lang), "ru") {
+		return ru
+	}
+	return en
+}
+
+// parseBoolSetting — разбор булевой `SETTING_<key>` (§2.11). Оба хоста присылают `true`/`false`
+// строчными — и дефолт из `module.json`, и юзер-оверрайд из карточки «Модули», — но сравнивать с
+// одним жёстким литералом всё равно нельзя: настройка, которую не разобрали, не отказывает, а
+// молча берёт `false`, и отличить это от «юзер выключил» уже нечем.
+//
+// ⛔ ЗАЧЕМ В КАНОНЕ. Копий было две, и они разошлись: `parseBoolSetting` у qWDTT принимал
+// `1/true/yes/on`, а OpenFlux сравнивал с `"true"` в одну строку. На один и тот же вход два модуля
+// отвечали бы по-разному — а трактовка формата, который задаёт ХОСТ, обязана быть одна.
+func parseBoolSetting(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
 const markerTimeFormat = "15:04:05.000000"
+
+// emitMarker — ЕДИНСТВЕННАЯ печать маркерной строки в stdout: таймстамп, маркер, payload, флаш.
+//
+// ⛔ ЗАЧЕМ ОДНА ТОЧКА. Связка «Printf с таймстампом + `os.Stdout.Sync()`» стояла шестью копиями —
+// по одной на каждый маркер, — и копии успели разойтись: `ACTION_REQUIRED` и `ACTION_CLOSE`
+// печатались БЕЗ таймстампа, хотя §2.9 требует его построчно. Разошлись они молча: обе строки
+// хост находит подстрокой (`indexOf` на Android, `Pos` на Desktop), поэтому отсутствие префикса
+// ничего не ломало — его просто не было видно, пока кто-нибудь не станет читать лог глазами.
+//
+// Флаш обязателен на КАЖДОЙ строке: stdout helper'а перенаправлен в файл, а не в терминал, и
+// буферизация там полная — без `Sync` хост увидит маркер не тогда, когда модуль его напечатал, а
+// когда наберётся 4 КБ. Для `EVENT_ACK`, которого хост ждёт с дедлайном, это разница между
+// «принято» и «модуль молчит».
+//
+// Пустой payload даёт строку без разделителя (`<ts> MARKER`), потому что `MARKER|` с пустым
+// хвостом хост разобрал бы как маркер с пустым значением, а это другое утверждение.
+func emitMarker(marker, payload string) {
+	line := marker
+	if payload != "" {
+		line += "|" + payload
+	}
+	fmt.Printf("%s %s\n", time.Now().Format(markerTimeFormat), line)
+	_ = os.Stdout.Sync()
+}
 
 // emitProgress — PROGRESS|<текст>: transient-тост ТОЛЬКО на connect-пути. Мид-сессионные
 // PROGRESS-строки хост структурно отбрасывает — показать их некому.
@@ -139,8 +205,7 @@ func emitProgress(format string, args ...any) {
 		return
 	}
 	progressLast = msg
-	fmt.Printf("%s PROGRESS|%s\n", time.Now().Format(markerTimeFormat), msg)
-	_ = os.Stdout.Sync()
+	emitMarker("PROGRESS", msg)
 }
 
 // emitLog — LOG|<текст>: ПОСТОЯННАЯ, листаемая запись в визуальном логе AntiNet (экран «Логи» +
@@ -148,8 +213,7 @@ func emitProgress(format string, args ...any) {
 // мид-сессионное действие) — не для высокочастотного per-connection шума (тому место в log.Printf,
 // который остаётся только в helper.stdout.log).
 func emitLog(format string, args ...any) {
-	fmt.Printf("%s LOG|%s\n", time.Now().Format(markerTimeFormat), fmt.Sprintf(format, args...))
-	_ = os.Stdout.Sync()
+	emitMarker("LOG", fmt.Sprintf(format, args...))
 }
 
 // Состояния маркера STATUS| (MODULE_API §2.13). Перечень ЗАКРЫТЫЙ: хост принимает решения только
@@ -180,12 +244,12 @@ func emitStatus(state string, detail string) {
 	}
 	lastEmittedStatus = state
 	detail = strings.ReplaceAll(strings.ReplaceAll(detail, "|", "/"), "\n", " ")
+	// Развилка на ЗНАЧЕНИИ, а не на операторе: печать одна, различается только payload.
+	payload := state
 	if detail != "" {
-		fmt.Printf("%s STATUS|%s|%s\n", time.Now().Format(markerTimeFormat), state, detail)
-	} else {
-		fmt.Printf("%s STATUS|%s\n", time.Now().Format(markerTimeFormat), state)
+		payload += "|" + detail
 	}
-	_ = os.Stdout.Sync()
+	emitMarker("STATUS", payload)
 }
 
 // emitEventAck — EVENT_ACK|<event> (MODULE_API §2.8): «событие хоста ПОЛУЧЕНО».
@@ -206,8 +270,7 @@ func emitEventAck(event string) {
 	if name == "" {
 		return
 	}
-	fmt.Printf("%s EVENT_ACK|%s\n", time.Now().Format(markerTimeFormat), name)
-	_ = os.Stdout.Sync()
+	emitMarker("EVENT_ACK", name)
 }
 
 // ── События хоста: один обработчик на оба транспорта ──────────────────────────────────────────
@@ -252,6 +315,14 @@ func handleHostEvent(event string) {
 		}
 		return
 	}
+	// `dns=<ip[,ip...]>` — ЕДИНСТВЕННАЯ причина с полезной нагрузкой, и канон забирает её ДО
+	// передачи модулю: список нужен прокладке shared/dns независимо от того, подписан ли модуль на
+	// это событие своим обработчиком. Модулю событие всё равно уходит дальше — тот, кто держит
+	// кэширующий резолвер, обязан ещё и сбросить кэш (`SetServers`), а этого канон за него решать
+	// не может.
+	if csv, ok := strings.CutPrefix(event, "dns="); ok {
+		rememberHostDNSServers(csv)
+	}
 	if h := hostEventHandler; h != nil {
 		h(event)
 	}
@@ -276,8 +347,7 @@ var (
 // `id` обязан быть уникальным на каждое действие.
 func runAction(profileDir, id string, payload map[string]any) (string, bool) {
 	pj, _ := json.Marshal(payload)
-	fmt.Printf("ACTION_REQUIRED|%s|%s\n", id, base64.StdEncoding.EncodeToString(pj))
-	_ = os.Stdout.Sync()
+	emitMarker("ACTION_REQUIRED", id+"|"+base64.StdEncoding.EncodeToString(pj))
 
 	s, timedOut := awaitActionResult(context.Background(), profileDir, id, actionDeadline)
 	if timedOut || s == "CANCELLED" {
@@ -292,8 +362,7 @@ func runAction(profileDir, id string, payload map[string]any) (string, bool) {
 // emitActionClose — ACTION_CLOSE|<id>: закрыть окно действия САМОМУ, не дожидаясь клика. Ради этого
 // и существует тип `display` отдельно от `confirm` (device-code, push-подтверждение).
 func emitActionClose(id string) {
-	fmt.Printf("ACTION_CLOSE|%s\n", id)
-	_ = os.Stdout.Sync()
+	emitMarker("ACTION_CLOSE", id)
 }
 
 // actionDeadline — потолок ожидания результата. Совпадает с hard-cap'ом хоста (~5 мин): ждать

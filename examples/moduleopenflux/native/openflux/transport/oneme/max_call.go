@@ -29,7 +29,7 @@ func (h *CallHandler) Send(data []byte) {
 }
 
 func (h *CallHandler) readLoop() {
-	// This process serves many keys at once - an unrecovered panic here would kill every other key's transport too.
+	// An unrecovered panic in any one key's goroutine kills the whole exit-node process, taking every other key's transport down with it.
 	defer func() {
 		if r := recover(); r != nil {
 			logError("recovered in CallHandler.readLoop: %v", r)
@@ -88,7 +88,7 @@ func (h *CallHandler) signalReconnect() {
 		default:
 		}
 	} else {
-		// No auto-reconnect for the receiver role yet - fail only this call handler, not the process.
+		// os.Exit(1) here used to kill the whole process over one key's dropped signaling connection; failing just this call handler beats taking every other key down with it.
 		logError("[%s] Receiver connection died - this call is over, other keys are unaffected", h.tag)
 	}
 }

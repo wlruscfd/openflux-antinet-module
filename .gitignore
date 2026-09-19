@@ -17,6 +17,10 @@ examples/*/native/*/cmd/helper/hostproto*.go
 examples/*/native/*/cmd/helper/entry_*.go
 examples/*/native/*/cmd/helper/socks5shared*.go
 examples/*/native/*/cmd/helper/dns_*.go
+examples/*/native/*/cmd/helper/dnsshim_*.go
 
 __pycache__/
 *.pyc
+
+# Bump-git per module (UPGRADE.md) - reconstructible from module.json's build.upstream.base.
+.bumpgits/

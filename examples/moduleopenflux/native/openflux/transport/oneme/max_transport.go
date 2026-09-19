@@ -29,7 +29,6 @@ func (t *OneMeTransport) SetEventCallback(fn func(code, detail string)) {
 	t.b.SetEventCallback(fn)
 }
 
-// ForceReconnect asks the call handler to re-establish now instead of waiting for the call to notice it's dead.
 func (t *OneMeTransport) ForceReconnect() {
 	if t.ch == nil {
 		return

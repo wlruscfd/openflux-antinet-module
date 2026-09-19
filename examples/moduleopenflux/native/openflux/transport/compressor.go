@@ -21,13 +21,13 @@ func NewCompressedTransport(inner Transport) Transport {
 }
 
 func (c *CompressedTransport) Send(data []byte) error {
-	compressed := compress(data)
+	compressed := Compress(data)
 	return c.Transport.Send(compressed)
 }
 
 func (c *CompressedTransport) Receive(callback func([]byte)) {
 	c.Transport.Receive(func(data []byte) {
-		decompressed, err := decompress(data)
+		decompressed, err := Decompress(data)
 		if err != nil {
 			callback(data) // fallback
 			return
@@ -36,7 +36,7 @@ func (c *CompressedTransport) Receive(callback func([]byte)) {
 	})
 }
 
-func compress(data []byte) []byte {
+func Compress(data []byte) []byte {
 	if len(data) <= MinCompressSize {
 		out := make([]byte, 1, len(data)+1)
 		out[0] = 0x00
@@ -61,7 +61,7 @@ func compress(data []byte) []byte {
 	return buf.Bytes()
 }
 
-func decompress(data []byte) ([]byte, error) {
+func Decompress(data []byte) ([]byte, error) {
 	if len(data) < 1 {
 		return data, nil
 	}

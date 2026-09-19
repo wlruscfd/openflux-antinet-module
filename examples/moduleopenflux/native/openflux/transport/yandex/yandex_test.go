@@ -19,11 +19,9 @@ import (
 
 // --- Send ---------------------------------------------------------------
 
-// TestSendQueuesEvenWhileDisconnected guards a real bug: Send used to reject during a reconnect even though WriteQueue survives it.
 func TestSendQueuesEvenWhileDisconnected(t *testing.T) {
 	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
 	tr.session = &DocSession{WriteQueue: make(chan []byte, 4)}
-	// Deliberately not calling tr.SetConnected(true) - this is the state during a reconnect.
 
 	if err := tr.Send([]byte("hello")); err != nil {
 		t.Fatalf("Send while disconnected but with a session = %v, want nil", err)
@@ -48,7 +46,6 @@ func TestSendFailsWithNoSessionAtAll(t *testing.T) {
 
 // --- self-echo filtering -------------------------------------------------
 
-// TestHandleMessageDropsOwnEcho guards against Yandex's doc broadcasting our own just-sent packet back to us as if from a peer.
 func TestHandleMessageDropsOwnEcho(t *testing.T) {
 	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
 
@@ -67,7 +64,7 @@ func TestHandleMessageDropsOwnEcho(t *testing.T) {
 	}
 }
 
-// TestHandleMessageDeliversRealPeerData guards that the echo filter doesn't swallow genuine peer data too.
+// The echo filter must not swallow data this transport never sent.
 func TestHandleMessageDeliversRealPeerData(t *testing.T) {
 	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
 
@@ -102,7 +99,6 @@ func buildBatch(t *testing.T, packets ...[]byte) []byte {
 	return blob.Bytes()
 }
 
-// TestHandleMessageUnbatchesMultiPacketPayload guards the batched wire format: several packets carried in one WS message.
 func TestHandleMessageUnbatchesMultiPacketPayload(t *testing.T) {
 	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
 
@@ -119,14 +115,13 @@ func TestHandleMessageUnbatchesMultiPacketPayload(t *testing.T) {
 	}
 }
 
-// TestHandleMessageStillHandlesUnbatchedLegacyPayload guards backward compatibility with a peer that hasn't picked up batching yet.
 func TestHandleMessageStillHandlesUnbatchedLegacyPayload(t *testing.T) {
 	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
 
 	var received [][]byte
 	tr.Receive(func(data []byte) { received = append(received, data) })
 
-	legacy := []byte{0x00, 'h', 'i'} // stored marker, not batchMarker
+	legacy := []byte{0x00, 'h', 'i'} // "stored" marker, not batchMarker
 	msg := `42["message",{"type":"cursor","cursor":"18;` + b64(legacy) + `"}]`
 	tr.handleMessage(nil, []byte(msg))
 
@@ -135,7 +130,7 @@ func TestHandleMessageStillHandlesUnbatchedLegacyPayload(t *testing.T) {
 	}
 }
 
-// TestHandleMessageDropsOwnEchoedBatch guards that self-echo dedup hashes the whole framed batch, not the individual packets.
+// Self-echo dedup must hash the whole framed batch, not individual packets.
 func TestHandleMessageDropsOwnEchoedBatch(t *testing.T) {
 	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
 
@@ -153,7 +148,6 @@ func TestHandleMessageDropsOwnEchoedBatch(t *testing.T) {
 	}
 }
 
-// TestWriterLoopBatchesMultiplePacketsIntoOneMessage guards that several quickly-queued packets go out as one WS message.
 func TestWriterLoopBatchesMultiplePacketsIntoOneMessage(t *testing.T) {
 	received := make(chan []byte, 1)
 	srv := serveHandshakeServer(t, func(conn *websocket.Conn) {
@@ -173,7 +167,6 @@ func TestWriterLoopBatchesMultiplePacketsIntoOneMessage(t *testing.T) {
 		t.Fatalf("Start: %v", err)
 	}
 	tr.SetConnected(true)
-	// Batching only turns on once the peer's keepalive has proven it understands batchMarker.
 	tr.peerBatches.Store(true)
 	queue := make(chan []byte, 10)
 	tr.session = &DocSession{Conn: conn, WriteQueue: queue}
@@ -212,7 +205,46 @@ func TestWriterLoopBatchesMultiplePacketsIntoOneMessage(t *testing.T) {
 	}
 }
 
-// TestWriterLoopDoesNotBatchByDefault guards that without proof the peer understands batchMarker, packets go out one per message.
+// writerLoop must not drain a queued backlog before IsConnected() is true (regression: see connectToDoc).
+func TestWriterLoopWaitsForConnectedBeforeDraining(t *testing.T) {
+	received := make(chan []byte, 1)
+	srv := serveHandshakeServer(t, func(conn *websocket.Conn) {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		received <- msg
+	})
+	defer srv.Close()
+
+	conn := dialTestServer(t, srv)
+	defer conn.Close()
+
+	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
+	if err := tr.BaseTransport.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	queue := make(chan []byte, 10)
+	tr.session = &DocSession{Conn: conn, WriteQueue: queue}
+	queue <- []byte("queued-before-auth")
+
+	go tr.writerLoop(queue)
+
+	select {
+	case msg := <-received:
+		t.Fatalf("writerLoop sent %q before IsConnected() was ever true", msg)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	tr.SetConnected(true)
+
+	select {
+	case <-received:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("writerLoop never drained the queue after IsConnected() became true")
+	}
+}
+
 func TestWriterLoopDoesNotBatchByDefault(t *testing.T) {
 	received := make(chan []byte, 10)
 	srv := serveHandshakeServer(t, func(conn *websocket.Conn) {
@@ -264,7 +296,6 @@ func TestWriterLoopDoesNotBatchByDefault(t *testing.T) {
 	}
 }
 
-// TestHandleMessageLearnsPeerBatchingFromKeepalive guards that only a keepalive carrying kaBatchCapabilityToken sets peerBatches.
 func TestHandleMessageLearnsPeerBatchingFromKeepalive(t *testing.T) {
 	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
 
@@ -279,9 +310,537 @@ func TestHandleMessageLearnsPeerBatchingFromKeepalive(t *testing.T) {
 	}
 }
 
+func TestHandleMessageLearnsZstdBatchCapabilityFromKeepalive(t *testing.T) {
+	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
+
+	tr.handleMessage(nil, []byte(`42["message",{"type":"cursor","cursor":"18;---KA---"}]`))
+	if tr.peerZstdBatches.Load() {
+		t.Fatalf("peerZstdBatches = true after a legacy keepalive with no capability token")
+	}
+
+	tr.handleMessage(nil, []byte(`42["message",{"type":"cursor","cursor":"18;---KA---`+kaBatchCapabilityToken+`"}]`))
+	if tr.peerZstdBatches.Load() {
+		t.Fatalf("peerZstdBatches = true after a keepalive carrying only the older kaBatchCapabilityToken")
+	}
+	if !tr.peerBatches.Load() {
+		t.Fatalf("peerBatches = false after a keepalive carrying kaBatchCapabilityToken")
+	}
+
+	tr2 := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
+	tr2.handleMessage(nil, []byte(`42["message",{"type":"cursor","cursor":"18;---KA---`+kaBatchCapabilityToken+kaZstdBatchCapabilityToken+`"}]`))
+	if !tr2.peerBatches.Load() || !tr2.peerZstdBatches.Load() {
+		t.Fatalf("peerBatches=%v peerZstdBatches=%v after a keepalive carrying both tokens, want both true",
+			tr2.peerBatches.Load(), tr2.peerZstdBatches.Load())
+	}
+}
+
+func TestSelfCompressReproducesLegacySingleFormatExactly(t *testing.T) {
+	received := make(chan []byte, 10)
+	srv := serveHandshakeServer(t, func(conn *websocket.Conn) {
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			received <- msg
+		}
+	})
+	defer srv.Close()
+
+	conn := dialTestServer(t, srv)
+	defer conn.Close()
+
+	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
+	tr.EnableSelfCompression()
+	if err := tr.BaseTransport.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	tr.SetConnected(true)
+	// Neither peerBatches nor peerZstdBatches set.
+	queue := make(chan []byte, 10)
+	tr.session = &DocSession{Conn: conn, WriteQueue: queue}
+	go tr.writerLoop(queue)
+
+	raw := []byte("a raw tunnel packet, not yet compressed by anything")
+	queue <- raw
+	wantWire := transport.Compress(raw)
+
+	select {
+	case msg := <-received:
+		base64Str := tr.extractBase64String(string(msg))
+		decoded, err := base64.StdEncoding.DecodeString(base64Str)
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if !bytes.Equal(decoded, wantWire) {
+			t.Fatalf("self-compress fallback wire bytes = %v, want exactly transport.Compress's output %v", decoded, wantWire)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never received the packet")
+	}
+}
+
+func TestSelfCompressReproducesLegacyBatchFormatExactly(t *testing.T) {
+	received := make(chan []byte, 1)
+	srv := serveHandshakeServer(t, func(conn *websocket.Conn) {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		received <- msg
+	})
+	defer srv.Close()
+
+	conn := dialTestServer(t, srv)
+	defer conn.Close()
+
+	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
+	tr.EnableSelfCompression()
+	if err := tr.BaseTransport.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	tr.SetConnected(true)
+	tr.peerBatches.Store(true) // old capability confirmed, new one not
+	queue := make(chan []byte, 10)
+	tr.session = &DocSession{Conn: conn, WriteQueue: queue}
+	go tr.writerLoop(queue)
+
+	pkts := [][]byte{[]byte("first raw packet"), []byte("a second, slightly longer raw packet")}
+	for _, p := range pkts {
+		queue <- p
+	}
+
+	var wantBlob bytes.Buffer
+	wantBlob.WriteByte(batchMarker)
+	var lenBuf [2]byte
+	for _, p := range pkts {
+		compressed := transport.Compress(p)
+		binary.BigEndian.PutUint16(lenBuf[:], uint16(len(compressed)))
+		wantBlob.Write(lenBuf[:])
+		wantBlob.Write(compressed)
+	}
+
+	select {
+	case msg := <-received:
+		base64Str := tr.extractBase64String(string(msg))
+		decoded, err := base64.StdEncoding.DecodeString(base64Str)
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if !bytes.Equal(decoded, wantBlob.Bytes()) {
+			t.Fatalf("self-compress legacy-batch wire bytes = %v, want exactly %v", decoded, wantBlob.Bytes())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never received the batch")
+	}
+}
+
+func TestSelfCompressUsesZstdBatchOnceBothTokensConfirmed(t *testing.T) {
+	received := make(chan []byte, 1)
+	srv := serveHandshakeServer(t, func(conn *websocket.Conn) {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		received <- msg
+	})
+	defer srv.Close()
+
+	conn := dialTestServer(t, srv)
+	defer conn.Close()
+
+	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
+	tr.EnableSelfCompression()
+	if err := tr.BaseTransport.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	tr.SetConnected(true)
+	tr.peerBatches.Store(true)
+	tr.peerZstdBatches.Store(true)
+	queue := make(chan []byte, 10)
+	tr.session = &DocSession{Conn: conn, WriteQueue: queue}
+	go tr.writerLoop(queue)
+
+	pkts := [][]byte{[]byte("raw packet one"), []byte("raw packet two, a bit longer this time")}
+	for _, p := range pkts {
+		queue <- p
+	}
+
+	select {
+	case msg := <-received:
+		base64Str := tr.extractBase64String(string(msg))
+		decoded, err := base64.StdEncoding.DecodeString(base64Str)
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(decoded) == 0 || decoded[0] != zstdBatchMarker {
+			t.Fatalf("expected a zstdBatchMarker-prefixed payload, got %v", decoded)
+		}
+		got, err := transport.DecodeBatch(decoded[1:])
+		if err != nil {
+			t.Fatalf("transport.DecodeBatch: %v", err)
+		}
+		if len(got) != len(pkts) {
+			t.Fatalf("got %d packets, want %d", len(got), len(pkts))
+		}
+		for i := range pkts {
+			if !bytes.Equal(got[i], pkts[i]) {
+				t.Errorf("packet[%d] = %q, want %q (raw, no per-packet compression)", i, got[i], pkts[i])
+			}
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never received the zstd batch")
+	}
+}
+
+func TestHandleMessageSelfCompressDecodesZstdBatch(t *testing.T) {
+	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
+	tr.EnableSelfCompression()
+
+	var received [][]byte
+	tr.Receive(func(data []byte) { received = append(received, append([]byte(nil), data...)) })
+
+	pkt1 := []byte("first raw packet")
+	pkt2 := []byte("second raw packet")
+	framed := append([]byte{zstdBatchMarker}, transport.EncodeBatch([][]byte{pkt1, pkt2})...)
+	msg := `42["message",{"type":"cursor","cursor":"18;` + b64(framed) + `"}]`
+	tr.handleMessage(nil, []byte(msg))
+
+	if len(received) != 2 || string(received[0]) != string(pkt1) || string(received[1]) != string(pkt2) {
+		t.Fatalf("received = %v, want [%q %q]", received, pkt1, pkt2)
+	}
+}
+
+func TestHandleMessageSelfCompressDecodesLegacySingleAndBatch(t *testing.T) {
+	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
+	tr.EnableSelfCompression()
+
+	var received [][]byte
+	tr.Receive(func(data []byte) { received = append(received, append([]byte(nil), data...)) })
+
+	raw := []byte("a raw packet from an old-format peer")
+	compressed := transport.Compress(raw)
+	msg := `42["message",{"type":"cursor","cursor":"18;` + b64(compressed) + `"}]`
+	tr.handleMessage(nil, []byte(msg))
+
+	if len(received) != 1 || string(received[0]) != string(raw) {
+		t.Fatalf("single-item: received = %v, want [%q] (decompressed)", received, raw)
+	}
+
+	received = nil
+	rawA, rawB := []byte("legacy batch packet A"), []byte("legacy batch packet B, a little longer")
+	legacyBatch := buildBatch(t, transport.Compress(rawA), transport.Compress(rawB))
+	msg2 := `42["message",{"type":"cursor","cursor":"18;` + b64(legacyBatch) + `"}]`
+	tr.handleMessage(nil, []byte(msg2))
+
+	if len(received) != 2 || string(received[0]) != string(rawA) || string(received[1]) != string(rawB) {
+		t.Fatalf("legacy batch: received = %v, want [%q %q] (decompressed)", received, rawA, rawB)
+	}
+}
+
+func TestNewYandexDocsTransportDefaultsToNotSelfCompressing(t *testing.T) {
+	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
+	if tr.selfCompress {
+		t.Fatalf("selfCompress = true on a freshly constructed transport, want false")
+	}
+}
+
+func TestHandleMessageLearnsEncSelfCompressCapabilityFromKeepalive(t *testing.T) {
+	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
+	tr.handleMessage(nil, []byte(`42["message",{"type":"cursor","cursor":"18;---KA---`+kaBatchCapabilityToken+kaZstdBatchCapabilityToken+kaEncSelfCompressToken+`"}]`))
+	if !tr.peerEncSelfCompress.Load() {
+		t.Fatalf("peerEncSelfCompress = false after a keepalive carrying kaEncSelfCompressToken")
+	}
+
+	tr2 := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
+	tr2.handleMessage(nil, []byte(`42["message",{"type":"cursor","cursor":"18;---KA---`+kaBatchCapabilityToken+kaZstdBatchCapabilityToken+`"}]`))
+	if tr2.peerEncSelfCompress.Load() {
+		t.Fatalf("peerEncSelfCompress = true after a keepalive with no kaEncSelfCompressToken")
+	}
+}
+
+func TestKeepAliveOnlySendsEncTokenWhenEncrypted(t *testing.T) {
+	plain := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
+	plain.EnableSelfCompression()
+	if plain.encrypted {
+		t.Fatalf("EnableSelfCompression must not set encrypted")
+	}
+
+	enc := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
+	enc.EnableEncryptedSelfCompression("shared-secret-token", false)
+	if !enc.encrypted {
+		t.Fatalf("EnableEncryptedSelfCompression must set encrypted")
+	}
+}
+
+func TestEncryptedSelfCompressReproducesLegacySingleFormatExactly(t *testing.T) {
+	received := make(chan []byte, 10)
+	srv := serveHandshakeServer(t, func(conn *websocket.Conn) {
+		for {
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			received <- msg
+		}
+	})
+	defer srv.Close()
+
+	conn := dialTestServer(t, srv)
+	defer conn.Close()
+
+	const token = "shared-secret-token"
+	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
+	tr.EnableEncryptedSelfCompression(token, false)
+	if err := tr.BaseTransport.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	tr.SetConnected(true)
+	queue := make(chan []byte, 10)
+	tr.session = &DocSession{Conn: conn, WriteQueue: queue}
+	go tr.writerLoop(queue)
+
+	raw := []byte("a raw tunnel packet for an e2e_encryption key")
+	queue <- raw
+
+	send, _ := transport.DeriveDirectionalKeys(token, false, "")
+
+	select {
+	case msg := <-received:
+		base64Str := tr.extractBase64String(string(msg))
+		decoded, err := base64.StdEncoding.DecodeString(base64Str)
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		plain, err := transport.Open(send, decoded)
+		if err != nil {
+			t.Fatalf("an unmodified peer (deriving the same key) must be able to decrypt this: %v", err)
+		}
+		wantPlain := transport.Compress(raw)
+		if !bytes.Equal(plain, wantPlain) {
+			t.Fatalf("decrypted content = %v, want exactly transport.Compress's output %v", plain, wantPlain)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never received the packet")
+	}
+}
+
+func TestEncryptedSelfCompressReproducesLegacyBatchFormatExactly(t *testing.T) {
+	received := make(chan []byte, 1)
+	srv := serveHandshakeServer(t, func(conn *websocket.Conn) {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		received <- msg
+	})
+	defer srv.Close()
+
+	conn := dialTestServer(t, srv)
+	defer conn.Close()
+
+	const token = "shared-secret-token"
+	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
+	tr.EnableEncryptedSelfCompression(token, false)
+	if err := tr.BaseTransport.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	tr.SetConnected(true)
+	tr.peerBatches.Store(true) // legacy batching confirmed, enc-self-compress not
+	queue := make(chan []byte, 10)
+	tr.session = &DocSession{Conn: conn, WriteQueue: queue}
+	go tr.writerLoop(queue)
+
+	pkts := [][]byte{[]byte("first raw packet"), []byte("second, slightly longer raw packet")}
+	for _, p := range pkts {
+		queue <- p
+	}
+
+	send, _ := transport.DeriveDirectionalKeys(token, false, "")
+
+	select {
+	case msg := <-received:
+		base64Str := tr.extractBase64String(string(msg))
+		decoded, err := base64.StdEncoding.DecodeString(base64Str)
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(decoded) == 0 || decoded[0] != batchMarker {
+			t.Fatalf("expected an UNENCRYPTED batchMarker-prefixed outer frame, got %v", decoded)
+		}
+		items := decodeBatch(decoded[1:])
+		if len(items) != len(pkts) {
+			t.Fatalf("got %d items, want %d", len(items), len(pkts))
+		}
+		for i, item := range items {
+			plain, err := transport.Open(send, item)
+			if err != nil {
+				t.Fatalf("item %d: an unmodified peer must be able to decrypt this: %v", i, err)
+			}
+			want := transport.Compress(pkts[i])
+			if !bytes.Equal(plain, want) {
+				t.Errorf("item %d decrypted = %v, want %v", i, plain, want)
+			}
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never received the batch")
+	}
+}
+
+func TestEncryptedSelfCompressUsesEncryptedZstdBatchOnceConfirmed(t *testing.T) {
+	received := make(chan []byte, 1)
+	srv := serveHandshakeServer(t, func(conn *websocket.Conn) {
+		_, msg, err := conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		received <- msg
+	})
+	defer srv.Close()
+
+	conn := dialTestServer(t, srv)
+	defer conn.Close()
+
+	const token = "shared-secret-token"
+	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
+	tr.EnableEncryptedSelfCompression(token, false)
+	if err := tr.BaseTransport.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	tr.SetConnected(true)
+	tr.peerBatches.Store(true)
+	tr.peerZstdBatches.Store(true)
+	tr.peerEncSelfCompress.Store(true)
+	queue := make(chan []byte, 10)
+	tr.session = &DocSession{Conn: conn, WriteQueue: queue}
+	go tr.writerLoop(queue)
+
+	pkts := [][]byte{[]byte("raw packet one"), []byte("raw packet two, a bit longer")}
+	for _, p := range pkts {
+		queue <- p
+	}
+
+	send, _ := transport.DeriveDirectionalKeys(token, false, "")
+
+	select {
+	case msg := <-received:
+		base64Str := tr.extractBase64String(string(msg))
+		decoded, err := base64.StdEncoding.DecodeString(base64Str)
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(decoded) > 0 && decoded[0] == batchMarker {
+			t.Fatalf("outer frame must be fully opaque ciphertext, not a visible batchMarker: %v", decoded)
+		}
+		plain, err := transport.Open(send, decoded)
+		if err != nil {
+			t.Fatalf("an unmodified peer with the same key must be able to decrypt this: %v", err)
+		}
+		if len(plain) == 0 || plain[0] != zstdBatchMarker {
+			t.Fatalf("decrypted content should start with zstdBatchMarker, got %v", plain)
+		}
+		got, err := transport.DecodeBatch(plain[1:])
+		if err != nil {
+			t.Fatalf("transport.DecodeBatch: %v", err)
+		}
+		if len(got) != len(pkts) {
+			t.Fatalf("got %d packets, want %d", len(got), len(pkts))
+		}
+		for i := range pkts {
+			if !bytes.Equal(got[i], pkts[i]) {
+				t.Errorf("packet[%d] = %q, want %q (raw, no per-packet compression)", i, got[i], pkts[i])
+			}
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("server never received the encrypted zstd batch")
+	}
+}
+
+func TestHandleEncryptedMessageDecodesLegacySingleAndBatch(t *testing.T) {
+	const token = "shared-secret-token"
+	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
+	tr.EnableEncryptedSelfCompression(token, true) // exit-node role, decrypts what a client sent
+
+	var received [][]byte
+	tr.Receive(func(data []byte) { received = append(received, append([]byte(nil), data...)) })
+
+	peerSend, _ := transport.DeriveDirectionalKeys(token, false, "")
+
+	raw := []byte("a raw packet from an unmodified encrypted peer")
+	sealed, err := transport.Seal(peerSend, 1, transport.Compress(raw))
+	if err != nil {
+		t.Fatalf("transport.Seal: %v", err)
+	}
+	msg := `42["message",{"type":"cursor","cursor":"18;` + b64(sealed) + `"}]`
+	tr.handleMessage(nil, []byte(msg))
+
+	if len(received) != 1 || string(received[0]) != string(raw) {
+		t.Fatalf("single-item: received = %v, want [%q]", received, raw)
+	}
+
+	received = nil
+	rawA, rawB := []byte("legacy batch packet A"), []byte("legacy batch packet B, a little longer")
+	sealedA, _ := transport.Seal(peerSend, 2, transport.Compress(rawA))
+	sealedB, _ := transport.Seal(peerSend, 3, transport.Compress(rawB))
+	legacyBatch := buildBatch(t, sealedA, sealedB)
+	msg2 := `42["message",{"type":"cursor","cursor":"18;` + b64(legacyBatch) + `"}]`
+	tr.handleMessage(nil, []byte(msg2))
+
+	if len(received) != 2 || string(received[0]) != string(rawA) || string(received[1]) != string(rawB) {
+		t.Fatalf("legacy batch: received = %v, want [%q %q]", received, rawA, rawB)
+	}
+}
+
+func TestHandleEncryptedMessageDecodesNewFormat(t *testing.T) {
+	const token = "shared-secret-token"
+	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
+	tr.EnableEncryptedSelfCompression(token, true)
+
+	var received [][]byte
+	tr.Receive(func(data []byte) { received = append(received, append([]byte(nil), data...)) })
+
+	peerSend, _ := transport.DeriveDirectionalKeys(token, false, "")
+	pkt1, pkt2 := []byte("raw one"), []byte("raw two")
+	plaintext := append([]byte{zstdBatchMarker}, transport.EncodeBatch([][]byte{pkt1, pkt2})...)
+	sealed, err := transport.Seal(peerSend, 1, plaintext)
+	if err != nil {
+		t.Fatalf("transport.Seal: %v", err)
+	}
+	msg := `42["message",{"type":"cursor","cursor":"18;` + b64(sealed) + `"}]`
+	tr.handleMessage(nil, []byte(msg))
+
+	if len(received) != 2 || string(received[0]) != string(pkt1) || string(received[1]) != string(pkt2) {
+		t.Fatalf("received = %v, want [%q %q]", received, pkt1, pkt2)
+	}
+}
+
+// Security-critical: anything that fails to decrypt must be dropped, never passed to CallReceive as if it were valid plaintext.
+func TestHandleEncryptedMessageDropsUndecryptableData(t *testing.T) {
+	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
+	tr.EnableEncryptedSelfCompression("shared-secret-token", true)
+
+	var received [][]byte
+	tr.Receive(func(data []byte) { received = append(received, data) })
+
+	// Sealed with a DIFFERENT token - authentication must fail.
+	wrongKeySend, _ := transport.DeriveDirectionalKeys("a-different-token", false, "")
+	sealed, _ := transport.Seal(wrongKeySend, 1, transport.Compress([]byte("should never be delivered")))
+	msg := `42["message",{"type":"cursor","cursor":"18;` + b64(sealed) + `"}]`
+	tr.handleMessage(nil, []byte(msg))
+
+	if len(received) != 0 {
+		t.Fatalf("handleMessage delivered data that failed to authenticate: %v", received)
+	}
+
+	// Plain garbage, too short to even carry a nonce counter.
+	tr.handleMessage(nil, []byte(`42["message",{"type":"cursor","cursor":"18;`+b64([]byte("hi"))+`"}]`))
+	if len(received) != 0 {
+		t.Fatalf("handleMessage delivered undersized garbage: %v", received)
+	}
+}
+
 // --- normalizeDocURL -------------------------------------------------
 
-// TestNormalizeDocURLRewritesDiskShareLinks guards that a disk.yandex.ru share link is rewritten before it reaches an HTTP request.
 func TestNormalizeDocURLRewritesDiskShareLinks(t *testing.T) {
 	cases := map[string]string{
 		"https://disk.yandex.ru/i/AbCdEfGh123":         "https://docs.yandex.ru/i/AbCdEfGh123",
@@ -289,7 +848,6 @@ func TestNormalizeDocURLRewritesDiskShareLinks(t *testing.T) {
 		"https://DISK.YANDEX.RU/i/CaseInsensitiveHost": "https://docs.yandex.ru/i/CaseInsensitiveHost",
 		// Already a docs.yandex.ru link - must pass through byte-for-byte.
 		"https://docs.yandex.ru/docs/edit?url=abc": "https://docs.yandex.ru/docs/edit?url=abc",
-		// A disk.yandex.ru path that isn't a /i/ share link - left alone.
 		"https://disk.yandex.ru/d/FolderShareLink": "https://disk.yandex.ru/d/FolderShareLink",
 		// Malformed - returned unchanged rather than dropped.
 		"not a url at all": "not a url at all",
@@ -317,7 +875,6 @@ func TestBackoffDelayGrowsAndCaps(t *testing.T) {
 		MaxReconnectDelay:   1 * time.Second,
 	})
 
-	// backoffDelay adds up to +50% jitter, so each uncapped value is checked as a range rather than an exact figure.
 	assertInJitterRange(t, tr.backoffDelay(0), 100*time.Millisecond)
 	assertInJitterRange(t, tr.backoffDelay(1), 200*time.Millisecond)
 	assertInJitterRange(t, tr.backoffDelay(2), 400*time.Millisecond)
@@ -357,7 +914,6 @@ func TestScheduleReconnectEmitsRetryingEvent(t *testing.T) {
 	var gotCode, gotDetail string
 	tr.SetEventCallback(func(code, detail string) {
 		gotCode, gotDetail = code, detail
-		// Stop the transport so scheduleReconnect's post-sleep check bails out instead of redialing.
 		tr.Stop()
 	})
 
@@ -489,7 +1045,6 @@ func TestFetchDocInfoValidConfig(t *testing.T) {
 		t.Errorf("WsURL = %q, want it to contain the doc key", info.WsURL)
 	}
 
-	// A request with only a bare User-Agent isn't a shape any real browser produces - itself a bot-detection signal.
 	if ua := gotHeaders.Get("User-Agent"); ua != browserUserAgent {
 		t.Errorf("User-Agent = %q, want %q", ua, browserUserAgent)
 	}
@@ -505,7 +1060,6 @@ func TestFetchDocInfoValidConfig(t *testing.T) {
 
 var upgrader = websocket.Upgrader{}
 
-// serveHandshakeServer spins up a real WS server playing the Yandex side of the handshake; respond drives each test's script.
 func serveHandshakeServer(t *testing.T, respond func(conn *websocket.Conn)) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -534,10 +1088,11 @@ func TestPerformHandshakeSuccessWaitsForAck(t *testing.T) {
 	ackSentAfterConnect := make(chan struct{}, 1)
 
 	srv := serveHandshakeServer(t, func(conn *websocket.Conn) {
+		// 1. engine.io open packet, with explicit ping settings.
 		open, _ := json.Marshal(map[string]int{"pingInterval": 25000, "pingTimeout": 5000})
 		conn.WriteMessage(websocket.TextMessage, append([]byte("0"), open...))
 
-		// Must receive the namespace-connect before sending the ack - the ordering the original bug violated.
+		// Must receive the namespace-connect BEFORE sending the ack - this is exactly the ordering the original bug violated.
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
 			t.Errorf("server read: %v", err)
@@ -558,7 +1113,6 @@ func TestPerformHandshakeSuccessWaitsForAck(t *testing.T) {
 			t.Errorf("namespace-connect token = %q, want %q", payload.Token, token)
 		}
 
-		// A mid-handshake ping - the client must answer it without mistaking it for the ack.
 		conn.WriteMessage(websocket.TextMessage, []byte("2"))
 		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 		_, pong, err := conn.ReadMessage()
@@ -566,6 +1120,7 @@ func TestPerformHandshakeSuccessWaitsForAck(t *testing.T) {
 			t.Errorf("expected a pong (%q) in response to the mid-handshake ping, got %q, err=%v", "3", pong, err)
 		}
 
+		// 3. Only now send the ack.
 		close(ackSentAfterConnect)
 		conn.WriteMessage(websocket.TextMessage, []byte(`40{"sid":"server-sid"}`))
 
@@ -613,7 +1168,6 @@ func TestPerformHandshakeFailsOnConnectError(t *testing.T) {
 }
 
 func TestPerformHandshakeDoesNotSendConnectBeforeOpen(t *testing.T) {
-	// If the client sent its namespace-connect before the open packet arrived, this handler would see it first.
 	srv := serveHandshakeServer(t, func(conn *websocket.Conn) {
 		conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
 		if _, _, err := conn.ReadMessage(); err == nil {

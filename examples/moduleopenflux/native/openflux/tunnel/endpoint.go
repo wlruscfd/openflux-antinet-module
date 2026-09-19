@@ -27,12 +27,10 @@ func NewTunnelLinkEndpoint() *TunnelLinkEndpoint {
 	return &TunnelLinkEndpoint{}
 }
 
-// PacketCounts is a cheap way to tell "nothing is reaching the gateway" apart from "packets arrive but relaying fails".
 func (e *TunnelLinkEndpoint) PacketCounts() (in, out uint64) {
 	return e.packetIn.Load(), e.packetOut.Load()
 }
 
-// SetOutgoingPacketHandler is exported so packages outside tunnel (e.g. gateway) can reuse this endpoint.
 func (e *TunnelLinkEndpoint) SetOutgoingPacketHandler(fn func([]byte)) {
 	e.onOutgoingPacket = fn
 }
@@ -40,11 +38,10 @@ func (e *TunnelLinkEndpoint) SetOutgoingPacketHandler(fn func([]byte)) {
 func (e *TunnelLinkEndpoint) InjectInbound(data []byte) {
 	e.packetIn.Add(1)
 	if utils.IsVerbose() {
-		// ParsePacketInfo builds a string on every call, so it's skipped when nothing will read it.
 		utils.Debugf("<- %d bytes - %s\n", len(data), network.ParsePacketInfo(data))
 	}
 
-	// dispatcher is a plain interface value; reading it unsynchronized with Attach's write let a nil dispatcher crash here.
+	// dispatcher is a plain interface value; reading it unsynchronized with Attach's write is a real data race that let a nil dispatcher slip through and crash.
 	e.dispatcherMu.RLock()
 	dispatcher := e.dispatcher
 	e.dispatcherMu.RUnlock()
@@ -52,22 +49,21 @@ func (e *TunnelLinkEndpoint) InjectInbound(data []byte) {
 		return
 	}
 
-	// The stack only registers TCP/UDP handlers; anything else (e.g. ICMP) nil-pointer-panics in gvisor's NAT code instead of erroring.
+	// Non-TCP/UDP packets (e.g. ICMP) have no registered handler and nil-pointer-panic the NAT/forwarding code - confirmed in production from a client's OS routing a ping into the tunnel's default route.
 	if len(data) < 20 || (data[9] != 6 && data[9] != 17) {
 		return
 	}
 
-	// Backstop: gvisor can still panic on other inputs (seen in production as "unexpected transport protocol = 0"), taking the whole process down otherwise.
+	// gvisor panics on some inputs instead of erroring (seen in production: "unexpected transport protocol = 0"); this runs on a shared goroutine so an unrecovered panic takes the whole process down.
 	defer func() {
 		if r := recover(); r != nil {
-			// Always logged (not gated behind IsVerbose) since this is already the rare, exceptional case worth capturing.
 			log.Printf("[TUNNEL] recovered from a panic dispatching an inbound packet (%d bytes, %s): %v",
 				len(data), network.ParsePacketInfo(data), r)
 		}
 	}()
 
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Payload: buffer.MakeWithData(append([]byte{}, data...)),
+		Payload: buffer.MakeWithData(data),
 	})
 	dispatcher.DeliverNetworkPacket(ipv4.ProtocolNumber, pkt)
 }

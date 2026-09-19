@@ -6,12 +6,11 @@ import (
 	"strings"
 )
 
-// TCPChecksum and UDPChecksum are thin wrappers over L4Checksum, differing only in the protocol number.
 func TCPChecksum(tcpData []byte, srcIP, dstIP [4]byte) uint16 {
 	return L4Checksum(tcpData, srcIP, dstIP, 6)
 }
 
-// UDPChecksum must not zero an unset checksum here - the exit node rewrites addresses that the sum covers.
+// UDPChecksum must not be zeroed when the computed sum is zero - transmit 0xFFFF instead (RFC 768), or the receiver drops the datagram silently.
 func UDPChecksum(udpData []byte, srcIP, dstIP [4]byte) uint16 {
 	return L4Checksum(udpData, srcIP, dstIP, 17)
 }

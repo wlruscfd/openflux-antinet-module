@@ -20,7 +20,6 @@ func EnableDebug() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds | log.Lshortfile)
 }
 
-// SetVerbose is EnableDebug but reversible, for turning logging on/off per session rather than for the process's life.
 func SetVerbose(enabled bool) {
 	verbose = enabled
 	if enabled && debugLog == nil {
@@ -28,7 +27,6 @@ func SetVerbose(enabled bool) {
 	}
 }
 
-// SetLogSink additionally forwards every Debugf line to fn on top of the normal stderr output; nil clears it.
 func SetLogSink(fn func(string)) {
 	sinkMu.Lock()
 	sink = fn
@@ -52,4 +50,16 @@ func Debugf(format string, args ...interface{}) {
 
 func IsVerbose() bool {
 	return verbose
+}
+
+// SafeGo recovers a panic inside fn and logs it instead of taking down the whole process - for a long-lived background loop nothing else on the stack would catch it.
+func SafeGo(name string, fn func()) {
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				Debugf("[PANIC] recovered in %s: %v", name, r)
+			}
+		}()
+		fn()
+	}()
 }

@@ -7,13 +7,15 @@
   "description": "TCP-туннель поверх мессенджеров: трафик уходит сообщениями курсора Яндекс.Документов либо сигнальным каналом звонка MAX. Транспорт выбирается ссылкой. Требуется свой exit-node OpenFlux.",
   "homepage": "https://github.com/p1neappleXpress/OpenFlux",
   "updateUrl": "https://raw.githubusercontent.com/wlruscfd/openflux-antinet-module/main/antinet-module.json",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "license": "GPL-3.0-or-later",
   "handoverMode": "signal",
-  "hostEvents": ["handover", "netlost", "netback", "stall"],
+  "hostEvents": ["handover", "netlost", "netback", "stall", "dns"],
   "parallelPing": false,
+  "pingWhileConnected": true,
   "pingTimeoutSec": 60,
   "socks5": true,
+  "socks5Udp": false,
   "dnsResolver": true,
   "settings": [
     {
@@ -49,6 +51,11 @@
   "build": {
     "goDir": "native/openflux",
     "goPkg": "./cmd/helper",
-    "ldflags": "-checklinkname=0"
+    "ldflags": "-checklinkname=0",
+    "upstream": {
+      "url": "https://github.com/wlruscfd/openflux-server",
+      "base": "1efc306c43d36d35e65b8f9c2cfa737f1953de80",
+      "take": "ours"
+    }
   }
 }

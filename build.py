@@ -84,9 +84,18 @@ CANONS = (
     {"dir": SHARED_HOSTPROTO, "glob": "hostproto*.go", "label": "hostproto", "gate": None, "android": True},
     {"dir": SHARED_ENTRY, "glob": "entry_*.go", "label": "entry", "gate": None, "android": True},
     {"dir": SHARED_SOCKS5, "glob": "socks5shared*.go", "label": "socks5", "gate": "socks5", "android": True},
+    # Прокладка к резолверам ОС — БЕЗ гейта, как protect/offtun: это абстракция от платформы, а не
+    # опция. Модулю может не понадобиться кэширующий резолвер dial-таргетов (`dnsResolver`), но
+    # добраться до резолверов системы, не уходя в TUN, обязан мочь любой. Маски не пересекаются:
+    # `dns_*.go` требует `_` сразу после `dns`, которого у `dnsshim_` нет.
+    {"dir": SHARED_DNS, "glob": "dnsshim_*.go", "label": "dns-shim", "gate": None, "android": True},
     {"dir": SHARED_DNS, "glob": "dns_*.go", "label": "dns", "gate": "dnsResolver", "android": True},
 )
-SHARED_CANONS = tuple(c["dir"] for c in CANONS)
+# Каталоги канонов БЕЗ повторов: у `shared/dns` два входа в CANONS (прокладка и кэширующий
+# резолвер различаются маской и гейтом, но лежат рядом), а потребителям этого кортежа нужен
+# каталог — `cmd_package` копирует его целиком и на втором заходе падал бы «уже существует».
+# `dict.fromkeys` вместо `set` намеренно: порядок канонов осмыслен и должен сохраняться.
+SHARED_CANONS = tuple(dict.fromkeys(c["dir"] for c in CANONS))
 
 # Реестр модулей строится из ЕДИНОГО дескриптора examples/<module>/module.json — ИСТОЧНИК ИСТИНЫ
 # (schemes/name/description/homepage/handoverMode/parallelPing/helperBinary{android,desktop}/
@@ -203,6 +212,15 @@ def _flat_descriptor_base(d, bundle_target):
     # Флаги канон-инъекций (`socks5` / `dnsResolver`) сознательно НЕ эмитим — они
     # build-time-only (их читает только таблица CANONS этого файла), рантайм-читателей нет ни на
     # одной платформе (проверено грепом).
+    #
+    # ⛔ `socks5Udp` — ИСКЛЮЧЕНИЕ из этой строки: он не build-time, у него есть рантайм-читатели
+    # на ОБЕИХ платформах (`ModuleManager.kt` J_SOCKS5_UDP → socks5UdpSupported;
+    # `modulemanager.pas` ParseModuleJson → Socks5UdpSupported). Не донести его = вернуть ровно ту
+    # ситуацию, ради которой он заведён: хост посчитает модуль UDP-способным, погонит в него QUIC,
+    # получит честный `0x07` и запишет это отказом дозвона. Эмитим только явный `false` —
+    # отсутствие ключа и есть дефолт `true`.
+    if d.get("socks5Udp") is False:
+        flat["socks5Udp"] = False
     if d.get("pingTimeoutSec"):
         flat["pingTimeoutSec"] = d["pingTimeoutSec"]
     if d.get("pingNeedsConsent"):
@@ -653,19 +671,19 @@ README_ARCHIVE_TEMPLATE = """# Модуль «__NAME__» для AntiNet (`__SCHE
 | `README.md` | этот файл — точка входа |
 __DOCS_ROWS__| `build.py` | сборщик helper-бинарей под все ОС. `python build.py --help`, `--doctor` |
 | `tools/build-module.py` | низкоуровневый Android-билдер (NDK clang → `.so`), зовётся из `build.py` |
-| `examples/__MODNAME__/` | **сам модуль-образец**: `module.json` (ЕДИНЫЙ дескриптор) + `native/` (Go data-plane) |
-| `shared/` | **каноны** — общий код всех модулей. `build.py` копирует их в main-пакет helper'а ПЕРЕД сборкой и убирает после; в дереве модуля их нет и класть туда не надо |
+| `examples/__MODNAME__/` | **сам модуль-образец**: `module.json` (единый дескриптор) + `native/` (Go data-plane) |
+| `shared/` | **каноны** — общий код всех модулей. `build.py` копирует их в main-пакет helper'а перед сборкой и убирает после; в дереве модуля их нет и класть туда не надо |
 | `antinet-module.example.json` | образец манифеста авто-обновления (реальный генерит `--bundle`) |
-| `LICENSE` | лицензия сборочной системы и канонов — **MIT**. Лицензия САМОГО модуля — `__LICENSE_ID__`, см. ниже |
+| `LICENSE` | лицензия сборочной системы и канонов — **MIT**. Лицензия самого модуля — `__LICENSE_ID__`, см. ниже |
 
 ## Лицензия
 
 __LICENSE_SECTION__
 
-Каноны — отдельный случай: `build.py` копирует `shared/*` в main-пакет твоего helper'а перед
-сборкой, то есть этот код физически попадает в твой бинарь. Он MIT намеренно — копилефта в нём нет,
-и твоему модулю он ничего не навязывает. Поэтому `SPDX-License-Identifier` стоит в шапке каждого
-канона: инжектированный файл уезжает в твоё дерево, и маркер обязан ехать вместе с ним.
+Каноны — отдельный случай: `build.py` копирует `shared/*` в main-пакет вашего helper'а перед
+сборкой, то есть этот код физически попадает в ваш бинарь. Он MIT намеренно — копилефта в нём нет,
+и вашему модулю он ничего не навязывает. Поэтому `SPDX-License-Identifier` стоит в шапке каждого
+канона: инжектированный файл уезжает в ваше дерево, и маркер обязан ехать вместе с ним.
 
 ### Каноны `shared/` — что инжектируется и когда
 
@@ -673,13 +691,13 @@ __LICENSE_SECTION__
 |---|---|---|
 | `shared/lifecycle/` | **всегда** | `dieWithParent` (PDEATHSIG), `protectFromOomKill`, `startHostEventReader` (события хоста), `writeReady` (маркер готовности) |
 | `shared/protect/` | **всегда** | `protectViaService` — SCM_RIGHTS-клиент protect-сервиса AntiNet (Android) |
-| `shared/socks5/` | `"socks5": true` | **весь SOCKS5-протокол**: рукопожатие, user/pass, разбор запроса, accept-петля, реле, UDP ASSOCIATE. Твоё дело — только транспорт |
+| `shared/socks5/` | `"socks5": true` | **весь SOCKS5-протокол**: рукопожатие, user/pass, разбор запроса, accept-петля, реле, UDP ASSOCIATE. Ваше дело — только транспорт |
 | `shared/offtun/` | **всегда** (гейта нет), но только в desktop-сборку | off-TUN bind сокета к физ-интерфейсу на desktop + десктопная половина protect-адаптеров (`dialControl`/`protectFdFunc`) |
 | `shared/hostproto/` | **всегда** | весь протокол разговора с хостом: разбор конфига, усыновление слушающего сокета, маркеры stdout, события хоста, интерактивные действия |
-| `shared/entry/` | **всегда** | точки входа: C-ABI-экспорты на Android, argv-разбор на десктопе. Тебе остаётся `realMain` + `moduleCall` |
-| `shared/dns/` | `"dnsResolver": true` | protected off-tunnel резолв твоих dial-таргетов (`newProtectedResolver`/`LookupHost`): TTL-кэш + single-flight + прямой UDP-запрос к `DNS_SERVERS` через твой же `dialControl` |
+| `shared/entry/` | **всегда** | точки входа: C-ABI-экспорты на Android, argv-разбор на десктопе. Вам остаётся `realMain` и `moduleCall` |
+| `shared/dns/` | `"dnsResolver": true` | protected off-tunnel резолв ваших dial-таргетов (`newProtectedResolver`/`LookupHost`): TTL-кэш + single-flight + прямой UDP-запрос к `DNS_SERVERS` через ваш же `dialControl` |
 
-## Свой модуль — папкой РЯДОМ с образцом
+## Свой модуль — папкой рядом с образцом
 
 `build.py` находит модули сам, сканируя `examples/*/module.json`. Никакого реестра править не надо:
 
@@ -700,7 +718,7 @@ python build.py --module mymod --os all             # ключ = имя папк
 python build.py --doctor --os all --module __MOD__
 ```
 
-Он печатает, что найдено, чего нет и КОМАНДУ установки под твою ОС. Коротко — три РАЗНЫХ
+Он печатает, что найдено, чего нет, и команду установки под вашу ОС. Коротко — три разных
 требования, и путать их не надо:
 
 | Что собираем | Чем | Кросс-компиляция |
@@ -708,14 +726,14 @@ python build.py --doctor --os all --module __MOD__
 | desktop-helper (`windows`/`linux`/`darwin`) | **только Go __GOMIN__+** (эту версию требует `go.mod` модуля; с go1.21 Go догружает нужный тулчейн сам) | **да, с любого хоста на любую ОС** (`CGO_ENABLED=0`, C-тулчейн не нужен) |
 | android-helper (`.so`, `c-shared`) | Go + **Android NDK** | **да, с любого хоста** |
 
-⛔ **C-компилятор модулю не нужен, и UI ты не пишешь.** Интерактивные действия (капча/логин/2FA)
-рисует КЛИЕНТ: модуль эмитит строку `ACTION_REQUIRED|<id>|<payloadB64>` с декларативным правилом,
+⛔ **C-компилятор модулю не нужен, и UI вы не пишете.** Интерактивные действия (капча, логин, 2FA)
+рисует клиент: модуль отправляет строку `ACTION_REQUIRED|<id>|<payloadB64>` с декларативным правилом,
 а рендерер принадлежит хосту — Android `ModuleActionActivity`, Desktop `antinet-action` (идёт
 вместе с клиентом, форкается для любого модуля). Легаси-поле `module.json: actionBinary`
-объявлять НЕ надо: на Android оно вообще не читается, на Desktop хостовый рендерер всегда
-пробуется первым. Подробно — `MODULE_SYSTEM.md` § «C-тулчейн модулю НЕ нужен».
+объявлять не надо: на Android оно вообще не читается, на Desktop хостовый рендерер всегда
+пробуется первым. Подробно — `MODULE_SYSTEM.md` § «C-тулчейн модулю не нужен».
 
-Плюс Python 3 для самого `build.py`. **Android SDK / Gradle / AGP НЕ нужны** ни для чего: модуль —
+Плюс Python 3 для самого `build.py`. **Android SDK, Gradle и AGP не нужны** ни для чего: модуль —
 файл, а не приложение. На Android он поставляется скачиваемой `.so` (`-buildmode=c-shared`),
 которую AntiNet грузит `dlopen`'ом в свой зарезервированный слот-процесс.
 
@@ -733,32 +751,32 @@ python build.py --module __MOD__ --os android --abis arm64-v8a,armeabi-v7a,x86_6
 `examples/__MODNAME__/dist/desktop/<os>_<arch>/` и `examples/__MODNAME__/dist/android/<abi>/`.
 
 ## 2. Где править протокол
-`examples/__MODNAME__/native/.../main.go` (+ соседние .go) — это data-plane helper'а. **ОСТАВЬ как есть**
-обязательную обвязку: SOCKS5-фронт на переданном хостом сокете, маркер готовности `ready`,
-protect-fd сокетов, сабкоманды `summarize`/`normalize` (контракт — `MODULE_API.md` §2.3).
+`examples/__MODNAME__/native/.../main.go` и соседние `.go` — это data-plane helper'а. **Оставьте как
+есть** обязательную обвязку: SOCKS5-фронт на переданном хостом сокете, маркер готовности `ready`,
+protect-fd сокетов, сабкоманды `summarize` и `normalize` (контракт — `MODULE_API.md` §2.3).
 
 ## 3. Публикация (чтобы AntiNet ставил по `antinet://`-ссылке и авто-обновлял)
-1. **СНАЧАЛА дескриптор, потом сборка.** В `module.json`: `updateUrl` = адрес, по которому БУДЕТ
-   лежать манифест, и поднятая `version`. Порядок именно такой, потому что `module.json` едет ВНУТРИ
+1. **Сначала дескриптор, потом сборка.** В `module.json`: `updateUrl` — адрес, по которому манифест
+   будет лежать, и поднятая `version`. Порядок именно такой, потому что `module.json` едет внутри
    каждого бандла: адрес, вписанный после сборки, до пользователей не доедет — у них не будет ни
    авто-проверки, ни рабочего «Поделиться модулем» (ссылка уйдёт без `m`, и получателю ставить
-   неоткуда). Правишь `updateUrl` позже — пересобирай и ПЕРЕЗАЛИВАЙ бандлы.
-   ⚠ Адрес манифеста обязан быть СТАБИЛЬНЫМ (файл на ветке, напр.
+   неоткуда). Правите `updateUrl` позже — пересоберите и перезалейте бандлы.
+   ⚠ Адрес манифеста обязан быть стабильным (файл на ветке, например
    `raw.githubusercontent.com/<owner>/<repo>/main/antinet-module.json`), его перезаписывают на каждый
    релиз. Release-ассет для манифеста не годится: у каждого релиза он свой, и запечённый в дескриптор
    адрес навсегда останется на старой версии. Сами ZIP'ы, наоборот, могут переезжать свободно.
-2. Собери релиз-артефакты:
+2. Соберите релиз-артефакты:
    ```
    python build.py --module __MOD__ --os all      # helper'ы под все цели → dist/
    python build.py --bundle --module __MOD__      # → dist-release/*.zip + antinet-module.json
    ```
-3. Залей на хостинг (напр. GitHub Releases) каждый `dist-release/*.zip`.
-4. Открой `dist-release/antinet-module.json`, впиши реальные URL'ы бандлов (`android[<abi>]` +
-   `desktop[<os>_<arch>]` — ВСЕ, что собрал: манифест без бандла под ABI устройства эта платформа
-   отвергает целиком) и залей его по адресу из шага 1.
+3. Залейте на хостинг (например GitHub Releases) каждый `dist-release/*.zip`.
+4. Откройте `dist-release/antinet-module.json`, впишите реальные URL'ы бандлов (`android[<abi>]` и
+   `desktop[<os>_<arch>]` — все, что собрали: манифест без бандла под ABI устройства эта платформа
+   отвергает целиком) и залейте его по адресу из шага 1.
 5. Следующий релиз — снова с шага 1: без поднятой `version` авто-проверка обновления не увидит.
    Сравнение посегментно-числовое, так что «1.3.10» корректно новее «1.3.7».
-6. Распространяй install-ссылку (один тап «скачать+поставить») — её собирает сам AntiNet
+6. Распространяйте install-ссылку (один тап «скачать и поставить») — её собирает сам AntiNet
    («Настройки → Модули → Поделиться модулем»), руками формат готовить не надо:
    `antinet://import?module=<base64url-no-pad JSON>`, где JSON =
    `{"s":"__SCHEME__","n":"__NAME__","m":"<updateUrl>","h":"__HOMEPAGE__"}`. Ключ `m` и есть
@@ -767,14 +785,14 @@ protect-fd сокетов, сабкоманды `summarize`/`normalize` (кон�
 Полная спецификация публикации/авто-обновления/ссылки — **`MODULE_API.md` §2.5**.
 
 ## Контракт (кратко)
-Helper ОБЯЗАН: обслуживать SOCKS5 на сокете, который дал хост; писать маркер `ready`; защищать
-исходящие сокеты protect-fd; отвечать на `<helper> summarize <link>` (имя+сервер) и
-`<helper> normalize <raw>`. Опции (хендовер `handoverMode`, off-TUN, интерактив-действия, настройки,
-тайминги, контракт восстановления) — `MODULE_API.md`.
+Helper обязан: обслуживать SOCKS5 на сокете, который дал хост; писать маркер `ready`; защищать
+исходящие сокеты protect-fd; отвечать на `<helper> summarize <link>` (имя и сервер) и
+`<helper> normalize <raw>`. Всё остальное — хендовер `handoverMode`, off-TUN, интерактивные действия,
+настройки, тайминги, контракт восстановления — в `MODULE_API.md`.
 """
 
 
-# ⚠ Лицензия архива НЕ одна: сборочная система и каноны — MIT всегда, а САМ модуль живёт под своей
+# ⚠ Лицензия архива не одна: сборочная система и каноны — MIT всегда, а сам модуль живёт под своей
 # (`module.json: license`), и она может быть строже. Молча накрыть архив общим MIT нельзя: у qWDTT
 # код производен от GPL-3.0-апстрима (замер: 85.9% совпадения по 19 одноимённым файлам, четыре
 # идентичны на 100%), и MIT над ним был бы ложным утверждением о правах. Поэтому раздел собирается
@@ -857,36 +875,41 @@ def _license_section(mod, d):
                 + "\n".join(f"- `{path}` — {name}"
                             + (f" · {holder}" if holder else "") for path, name, holder in nested))
     if lic == "MIT":
-        return ("Сборочная система, каноны и код самого модуля — **MIT** (`LICENSE`). Делай что\n"
-                "хочешь: свой модуль может быть закрытым, коммерческим, под любой другой лицензией.\n"
+        return ("Сборочная система, каноны и код самого модуля — **MIT** (`LICENSE`). Ограничений\n"
+                "нет: ваш модуль может быть закрытым, коммерческим, под любой другой лицензией.\n"
                 "Единственное требование — сохранить текст лицензии и копирайт в копиях этого кода."
                 + tail)
-    return (f"⚠ Лицензий в архиве ДВЕ, и это не формальность.\n\n"
+    return (f"⚠ Лицензий в архиве две, и это не формальность.\n\n"
             f"- **Сборочная система и каноны** (`build.py`, `tools/`, `shared/`, доки) — **MIT**\n"
             f"  (`LICENSE` в корне архива).\n"
             f"- **Сам модуль** `examples/module{mod}/` — **{lic}** "
             f"(`examples/module{mod}/LICENSE`).\n\n"
             f"MIT совместим с {lic} в одну сторону: собранный из этого архива модуль распространяется\n"
-            f"на условиях {lic}. Если делаешь свой модуль на базе канонов — на ТВОЙ код\n"
-            f"распространяется MIT, и копилефт этого модуля тебя не касается: бери за образец echo,\n"
-            f"а не этот модуль, если не хочешь наследовать {lic}." + tail)
+            f"на условиях {lic}. Если вы делаете свой модуль на базе канонов, на ваш код\n"
+            f"распространяется MIT, и копилефт этого модуля вас не касается: берите за образец echo,\n"
+            f"а не этот модуль, если не хотите наследовать {lic}." + tail)
 
 
 def _docs_rows(mod):
     """Строки таблицы «что внутри» для доков системы. Их несёт только эталонный архив, поэтому
     и строки о них появляются только там — таблица обязана описывать РЕАЛЬНОЕ содержимое, иначе
     первое же действие читателя (открыть MODULE_API.md) упирается в отсутствующий файл."""
+    # UPGRADE.md есть в КАЖДОМ архиве: он про работу автора со СВОИМ апстримом, а не про
+    # AntiNet-сторону, поэтому его строка стоит до развилки.
+    upgrade = ("| `UPGRADE.md` | **бамп апстрима одной командой** — как влить новую версию своего "
+               "апстрима трёхсторонним слиянием, не потеряв интеграционный слой |\n")
     if mod != DOCS_REFERENCE_MODULE:
         # Текст README ниже ссылается на эти доки по именам. Одна честная строка разрешает ВСЕ
         # такие ссылки разом — лучше, чем помечать каждое упоминание по отдельности.
-        return ("| _(доков системы здесь нет)_ | `MODULE_API.md` / `MODULE_SYSTEM.md` / `PORTING.md` "
-                "в этот архив не входят: он — авторская поставка модуля, а не SDK. Ссылки на них "
-                f"ниже ведут в эталонный архив `{DOCS_REFERENCE_MODULE}-module` и в репозиторий "
-                "AntiNet |\n")
-    return (
+        return upgrade + (
+            "| _(остальных доков системы здесь нет)_ | `MODULE_API.md` / `MODULE_SYSTEM.md` / "
+            "`PORTING.md` в этот архив не входят: он — авторская поставка модуля, а не SDK. "
+            f"Ссылки на них ниже ведут в эталонный архив `{DOCS_REFERENCE_MODULE}-module` и в "
+            "репозиторий AntiNet |\n")
+    return upgrade + (
         "| `MODULE_SYSTEM.md` | **обзор модульной системы**: из чего состоит модуль, тулчейн "
         "(какие компиляторы/NDK, кросс-компиляция), быстрый старт, публикация |\n"
-        "| `MODULE_API.md` | **КОНТРАКТ** — что helper обязан предоставить, семантика каждого "
+        "| `MODULE_API.md` | **контракт** — что helper обязан предоставить, семантика каждого "
         "ключа `module.json`, все опции |\n"
         "| `PORTING.md` | внутренности AntiNet-стороны (кому портировать/чинить хост) |\n")
 
@@ -986,6 +1009,11 @@ def cmd_package(mod):
             "<!-- Копия module_system/README.md из репозитория AntiNet. Пути приведены к раскладке\n"
             "     этого архива: префикс `module_system/` в нём отсутствует. -->\n\n"
             + (HERE / "README.md").read_text(encoding="utf-8"), encoding="utf-8")
+
+    # UPGRADE.md — в КАЖДЫЙ архив, в отличие от контракта выше. Он не про AntiNet-сторону, а про
+    # РАБОТУ АВТОРА: как влить новую версию СВОЕГО апстрима, не потеряв интеграционный слой.
+    # Автору qWDTT/masterdns он нужнее, чем автору эталона: у них апстрим живой и бампается.
+    shutil.copy2(HERE / "UPGRADE.md", stage / "UPGRADE.md")
 
     # ⛔ ОДИН проход по ВСЕМ .md стейджа — ровно потому, что правило заявлено единым. Пока правка
     # висела на перечне файлов, доки утекали мимо неё поштучно: MODULE_API.md и PORTING.md ехали
@@ -1206,6 +1234,294 @@ HELP_EPILOG = """
 """
 
 
+BUMPGITS = HERE / ".bumpgits"   # каталоги бамп-гитов; рабочее дерево у них — папка модуля
+
+
+def _git(gitdir, *args, check=True, quiet=False):
+    """git --git-dir=<...> <args>. Всегда с явным --git-dir: голый `git` внутри дерева адресует
+    ТОТ репозиторий, в чьей рабочей копии стоишь, и это почти никогда не тот, что имелся в виду —
+    ровно эта неоднозначность в истории проекта и стоила потерянных правок."""
+    r = subprocess.run(["git", f"--git-dir={gitdir}", *args],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if check and r.returncode != 0 and not quiet:
+        err(f"git {' '.join(args)} → код {r.returncode}")
+        if r.stderr.strip():
+            info(r.stderr.strip()[:500])
+    return r
+
+
+def _bump_bootstrap(mod, m, up, work, gitdir):
+    """Заводит бамп-гит: апстрим-база веткой `upstream`, наши правки веткой `<mod>` поверх неё.
+
+    ⛔ ПОЧЕМУ КАТАЛОГ ГИТА ЛЕЖИТ ВНЕ ДЕРЕВА. `.git` ВНУТРИ дерева модуля превратил бы его для
+    внешнего репозитория в gitlink, и сотни отслеживаемых файлов исчезли бы из индекса. Но git не
+    требует, чтобы каталог репозитория лежал в рабочем дереве: `core.worktree` их разводит.
+    Внутри дерева не появляется ничего.
+
+    Идемпотентна: прерванный прогон до-выполняется без повторного fetch'а."""
+    if not (work / "go.mod").exists() and not any(work.glob("*.go")):
+        err(f"[{mod}] нет дерева модуля: {work}"); return False
+
+    BUMPGITS.mkdir(exist_ok=True)
+    if not gitdir.exists():
+        info(f"[{mod}] создаю {gitdir.relative_to(HERE)}")
+        if subprocess.run(["git", "init", "--bare", "-q", str(gitdir)]).returncode != 0:
+            err(f"[{mod}] git init не удался"); return False
+
+    _git(gitdir, "config", "core.bare", "false")
+    _git(gitdir, "config", "core.worktree", str(work))
+    # autocrlf=TRUE, не false: файлы вендоренных деревьев лежат на диске в CRLF, апстрим хранит
+    # LF. Без нормализации бамп-гит объявил бы изменёнными ВСЕ файлы, то есть патч-слоем стало
+    # бы всё дерево, и слияние потеряло бы смысл.
+    _git(gitdir, "config", "core.autocrlf", "true")
+    for k, dflt in (("user.name", "AntiNet module bump"), ("user.email", "bump@antinet.local")):
+        cur = subprocess.run(["git", "config", "--get", k], capture_output=True, text=True,
+                             cwd=str(REPO)).stdout.strip()
+        _git(gitdir, "config", k, cur or dflt)
+    if _git(gitdir, "remote", "get-url", "origin", check=False, quiet=True).returncode != 0:
+        _git(gitdir, "remote", "add", "origin", up["url"])
+
+    base = up["base"]
+    if _git(gitdir, "rev-parse", "--verify", "-q", f"{base}^{{commit}}", check=False, quiet=True).returncode != 0:
+        info(f"[{mod}] fetch {up['url']} (нужна ИСТОРИЯ, не снимок — иначе merge-base не найдётся)")
+        if _git(gitdir, "fetch", "-q", "--tags", "origin").returncode != 0:
+            err(f"[{mod}] fetch не удался"); return False
+
+    # ⛔ ВЕТКУ МОДУЛЯ ПРОВЕРЯЕМ ДО создания синтетического `upstream`. Для `prefix`/`take` сторона
+    # слияния — commit-tree, и он даёт НОВЫЙ хеш на каждом вызове даже при том же дереве (меняется
+    # время коммита). Пересоздавать его на уже заведённом бамп-гите значит переписать
+    # `refs/heads/upstream` коммитом, которого нет в истории ветки модуля, — и следующее слияние
+    # падает с `refusing to merge unrelated histories`. Поймано на OpenFlux: два коммита
+    # «upstream subset @ 7fab61f» с одинаковым деревом и разными хешами, общего предка нет.
+    ours = f"refs/heads/{mod}"
+    have = _git(gitdir, "rev-parse", "--verify", "-q", ours, check=False, quiet=True)
+    if have.returncode == 0 and _git(gitdir, "rev-parse", "--verify", "-q", "refs/heads/upstream",
+                                     check=False, quiet=True).returncode == 0:
+        ok(f"[{mod}] патч-слой уже закоммичен")
+        return True
+
+    up_commit = _bump_upstream_commit(mod, gitdir, up, base, parent=None, work=work)
+    if not up_commit:
+        return False
+    _git(gitdir, "update-ref", "refs/heads/upstream", up_commit)
+
+    _git(gitdir, "symbolic-ref", "HEAD", ours)
+    _git(gitdir, "update-ref", ours, up_commit)
+    _git(gitdir, "reset", "-q", "--mixed")   # только индекс; --hard затёр бы наши правки апстримом
+    changed = [l[3:] for l in _git(gitdir, "status", "--porcelain").stdout.splitlines() if l[3:]]
+    info(f"[{mod}] наш слой против {base}: {len(changed)} файл(ов)")
+    # Поимённо, а не `add -A`: правило проекта запрещает массовый add, и здесь оно не отменяется.
+    for chunk in (changed[i:i + 200] for i in range(0, len(changed), 200)):
+        _git(gitdir, "add", "--", *chunk)
+    if _git(gitdir, "commit", "-q", "-m", f"AntiNet integration layer on top of {base}").returncode != 0:
+        err(f"[{mod}] коммит патч-слоя не удался"); return False
+    ok(f"[{mod}] бамп-гит заведён: ветка '{mod}' поверх {base}")
+    return True
+
+
+def _bump_subset_tree(mod, gitdir, rev, work):
+    """Дерево апстрима, ОГРАНИЧЕННОЕ путями, которые есть в дереве модуля (`upstream.take: ours`).
+
+    ⛔ ЗАЧЕМ. Бывает, что модуль берёт из апстрима не всё и не подкаталог, а ВЫБОРКУ: у OpenFlux
+    апстрим — большой репозиторий (сервер, controlplane, админка), а модулю нужны `transport/`,
+    `network/`, `utils/` и два файла из `tunnel/`. Настоящий апстримный коммит такой стороной
+    слияния быть не может: merge принёс бы весь сервер в дерево модуля.
+
+    Выборка НЕ списком путей в дескрипторе, а выводится из факта — какие файлы у нас уже лежат.
+    Список руками устарел бы первым же апстримным переименованием, и разошёлся бы молча.
+
+    Следствие, которое надо знать: НОВЫЙ файл апстрима бамп не принесёт — его у нас нет, значит в
+    сторону слияния он не попадает. Это не потеря, а свойство модели «берём выборку»: подключить
+    новый файл — сознательное решение автора, а не побочный эффект бампа."""
+    # ⛔ ОТДЕЛЬНЫЙ индекс. Сборка выборки — операция над ИНДЕКСОМ (`read-tree` + выкидывание
+    # лишнего), и делать её в основном индексе бамп-гита нельзя: он описывает наш слой, а после
+    # такой подмены следующий же checkout/merge материализовал бы в дерево модуля весь апстрим.
+    # Проверено на себе: первый прогон занёс в дерево OpenFlux 28 чужих путей (`controlplane/`,
+    # `LICENSE`, `build_android.sh`), которых модуль не берёт.
+    tmp_index = gitdir / "bump-subset.index"
+    env = dict(os.environ, GIT_INDEX_FILE=str(tmp_index))
+
+    def gi(*args, stdin=None):
+        return subprocess.run(["git", f"--git-dir={gitdir}", *args], input=stdin, env=env,
+                              capture_output=True, text=True, encoding="utf-8", errors="replace")
+
+    try:
+        if gi("read-tree", rev).returncode != 0:
+            err(f"[{mod}] read-tree {rev[:12]} не удался"); return None
+        upstream_files = set(gi("ls-files").stdout.splitlines())
+        ours = set()
+        for p in work.rglob("*"):
+            if p.is_file():
+                rel = p.relative_to(work).as_posix()
+                if not rel.startswith(".git"):
+                    ours.add(rel)
+        drop = sorted(upstream_files - ours)
+        if drop:
+            # -z/NUL-separated: text-mode stdin on Windows rewrites \n to \r\n, which would leave
+            # every path with a trailing \r that matches nothing and silently "ignores" it.
+            r = gi("update-index", "--force-remove", "-z", "--stdin", stdin="\0".join(drop) + "\0")
+            if r.returncode != 0:
+                err(f"[{mod}] update-index --force-remove: {r.stderr.strip()[:200]}"); return None
+        kept = len(upstream_files) - len(drop)
+        info(f"[{mod}] сторона слияния: {kept} файл(ов) апстрима (из {len(upstream_files)}), "
+             f"остальных модуль не берёт")
+        made = gi("write-tree")
+        if made.returncode != 0 or not made.stdout.strip():
+            err(f"[{mod}] write-tree не удался"); return None
+        return made.stdout.strip()
+    finally:
+        tmp_index.unlink(missing_ok=True)
+
+
+def _bump_upstream_commit(mod, gitdir, up, ref, parent, work=None):
+    """Коммит, чьё ДЕРЕВО — апстрим на ревизии `ref`, приведённый к раскладке модуля.
+
+    Три случая, и выбор между ними — по дескриптору:
+
+    * `prefix` — апстрим держит код в подкаталоге, у нас он распластан в корне (qWDTT: `go_client`);
+    * `take: "ours"` — модуль берёт из апстрима ВЫБОРКУ файлов (OpenFlux), см. `_bump_subset_tree`;
+    * ни того ни другого — дерево совпадает с апстримом (masterdns), берём коммит как есть.
+
+    `parent` связывает синтетические коммиты в цепочку — без него у СЛЕДУЮЩЕГО бампа не найдётся
+    общего предка, и слияние выродится в перезапись."""
+    prefix = (up.get("prefix") or "").strip("/")
+    take = (up.get("take") or "").strip().lower()
+    rev = _git(gitdir, "rev-parse", "--verify", "-q", f"{ref}^{{commit}}", check=False, quiet=True)
+    if rev.returncode != 0:
+        err(f"[{mod}] ревизии '{ref}' нет в апстриме — сверь build.upstream.base в module.json")
+        return None
+    rev = rev.stdout.strip()
+
+    if take == "ours":
+        tree = _bump_subset_tree(mod, gitdir, rev, work)
+        if not tree:
+            return None
+        label = f"upstream subset @ {ref}"
+    elif prefix:
+        sub = _git(gitdir, "rev-parse", "--verify", "-q", f"{rev}:{prefix}", check=False, quiet=True)
+        if sub.returncode != 0:
+            err(f"[{mod}] в {ref} нет подкаталога '{prefix}'"); return None
+        tree, label = sub.stdout.strip(), f"upstream {prefix} @ {ref}"
+    else:
+        return rev
+
+    args = ["commit-tree", tree, "-m", label]
+    if parent:
+        args += ["-p", parent]
+    made = _git(gitdir, *args)
+    if made.returncode != 0 or not made.stdout.strip():
+        err(f"[{mod}] commit-tree не отдал коммит"); return None
+    return made.stdout.strip()
+
+
+def cmd_bump(mod, ref):
+    """`--bump <ref>` — влить новую версию апстрима в дерево модуля ТРЁХСТОРОННИМ СЛИЯНИЕМ.
+
+    ⛔ ЗАЧЕМ ИМЕННО СЛИЯНИЕ. Инвариант метода: наш интеграционный слой обязан быть ОДНОЙ
+    СТОРОНОЙ слияния. Тогда git физически не может выбрать апстрим молча — любая коллизия
+    становится маркером конфликта в файле. Копирование апстрима поверх, `git apply --3way` и
+    перенос правок руками этим свойством НЕ обладают: они берут апстримную сторону без единого
+    маркера, и пропажа обнаруживается уже у пользователя.
+
+    Апстрим-координаты живут в `module.json` → `build.upstream` (url/base/prefix). Секция
+    `build` — build-time-only: в плоский дескриптор для хоста она не эмитится."""
+    m = MODULES[mod]
+    up = (m["descriptor"].get("build") or {}).get("upstream")
+    if not up or not up.get("url") or not up.get("base"):
+        err(f"[{mod}] в module.json нет build.upstream.{{url,base}} — бампать нечем")
+        info('пример: "upstream": {"url": "https://github.com/...", "base": "v1.4.3", "prefix": "go_client"}')
+        return False
+
+    work = (REPO / m["dir"]).resolve()
+    gitdir = BUMPGITS / f"{mod}.git"
+    info(f"[{mod}] {up['base']} → {ref}")
+
+    if not _bump_bootstrap(mod, m, up, work, gitdir):
+        return False
+
+    # ⛔ ГЕЙТ. Незакоммиченное в бамп-гите = патчи лежат рабочим слоем, а не коммитом; слияние в
+    # этом состоянии берёт апстримную сторону МОЛЧА и не порождает ни одного маркера.
+    if _git(gitdir, "diff", "--quiet", "HEAD", check=False, quiet=True).returncode != 0:
+        err(f"[{mod}] в дереве есть незакоммиченное — слияние взяло бы апстрим молча")
+        for l in _git(gitdir, "diff", "--name-only", "HEAD").stdout.splitlines()[:10]:
+            info(l)
+        info("закоммить их в бамп-гит (они — наша сторона слияния) и повтори")
+        return False
+
+    info(f"[{mod}] fetch {ref}")
+    if _git(gitdir, "fetch", "-q", "--tags", "origin").returncode != 0:
+        err(f"[{mod}] fetch не удался"); return False
+
+    prev = _git(gitdir, "rev-parse", "refs/heads/upstream").stdout.strip()
+    new_up = _bump_upstream_commit(mod, gitdir, up, ref, parent=prev, work=work)
+    if not new_up:
+        return False
+    # Сравнение по ДЕРЕВУ, а не по хешу коммита: для `prefix`/`take` сторона слияния синтетическая,
+    # её коммит получает нового родителя на каждом прогоне и потому всегда новый — по хешу «не
+    # изменилось» не поймать никогда.
+    prev_tree = _git(gitdir, "rev-parse", f"{prev}^{{tree}}", check=False, quiet=True).stdout.strip()
+    new_tree = _git(gitdir, "rev-parse", f"{new_up}^{{tree}}", check=False, quiet=True).stdout.strip()
+    if new_tree and new_tree == prev_tree:
+        ok(f"[{mod}] апстрим не изменился — бампать нечего")
+        return True
+    _git(gitdir, "update-ref", "refs/heads/upstream", new_up)
+
+    r = _git(gitdir, "merge", "upstream", "--no-edit", check=False)
+    out = (r.stdout + r.stderr).strip()
+    if r.returncode == 0:
+        ok(f"[{mod}] слияние без конфликтов")
+        if out:
+            info(out.splitlines()[-1][:200])
+    else:
+        conflicts = _git(gitdir, "diff", "--name-only", "--diff-filter=U").stdout.split()
+        err(f"[{mod}] конфликтов: {len(conflicts)} — разреши их в ДЕРЕВЕ МОДУЛЯ, маркерами")
+        for c in conflicts:
+            info(c)
+        info(f"после правки: git --git-dir={gitdir} add -- <файлы> && git --git-dir={gitdir} commit")
+    info(f"[{mod}] ⚠ обнови build.upstream.base на '{ref}' в module.json и закоммить дерево во внешний репозиторий")
+    return r.returncode == 0
+
+
+def cmd_test(mod):
+    """`go test` main-пакета helper'а С ИНЖЕКТИРОВАННЫМИ канонами.
+
+    Канон сам по себе не компилируется: `dialControl`/`protectStat` ему дают `shared/protect`
+    (android) и `shared/offtun` (десктоп), `golang.org/x/*` — `go.mod` модуля. Поэтому тесты канона
+    лежат РЯДОМ с каноном и приезжают тем же инжектом: маска в CANONS захватывает `*_test.go`
+    наравне с кодом, а `go build` тестовые файлы игнорирует — обычной сборке они не мешают.
+
+    Прогон под ХОСТ-ОС: тест проверяет логику, а кросс-компиляцию проверяет обычная сборка под
+    каждую цель. Платформенная половина канона (`dns_system_windows.go` и её unix-пара) тем самым
+    проверяется тестом только на своей ОС — это и есть причина гонять `--test` на обеих."""
+    m = MODULES[mod]
+    go_dir = REPO / m["dir"]
+    if not (go_dir / "go.mod").exists():
+        err(f"go.mod не найден: {go_dir}"); return False
+    go = find_go()
+    if not go:
+        err("Go не найден на хосте — `build.py --doctor` скажет, где его взять"); return False
+    info(f"[{mod}] go test {m['pkg']} (каноны инжектированы)")
+    injected = inject_canons(m, go_dir)
+    try:
+        # `-vet=off`: `go test` по умолчанию гоняет vet, а его printf-анализатор несовместим с
+        # локализацией модулей (§2.9) — строка формата приходит из языковой таблицы по `APP_LANG`,
+        # то есть переменной, и vet считает это подозрительным в КАЖДОМ модуле. Проверять надо
+        # логику, а не то, что формат берётся из таблицы, как контракт и предписывает.
+        # `-count=1` — без кэша: канон приезжает инжектом, и кэш `go test` этой подмены не видит.
+        r = subprocess.run([go, "test", "-count=1", "-vet=off", m["pkg"]],
+                           cwd=str(go_dir), env=dict(os.environ, CGO_ENABLED="0"))
+    finally:
+        for p in injected:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+    if r.returncode != 0:
+        err(f"[{mod}] go test упал (код {r.returncode})"); return False
+    ok(f"[{mod}] тесты прошли")
+    return True
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Единый сборщик helper-бинарей протокол-модулей AntiNet (MODULE_API §4–§5).",
@@ -1227,6 +1543,10 @@ def main():
                     help="собрать самодостаточный архив модуля для автора → dist-archive/<mod>-module-v<ver>.zip")
     ap.add_argument("--bundle", action="store_true",
                     help="release-бандлы (плоский ZIP каждого dist/<target>/) + скелет манифеста авто-обновления → dist-release/")
+    ap.add_argument("--test", action="store_true",
+                    help="go test main-пакета helper'а с инжектированными канонами (тесты shared/* живут рядом с каноном)")
+    ap.add_argument("--bump", metavar="REF",
+                    help="влить версию апстрима (тег/ветка/коммит) в дерево модуля ТРЁХСТОРОННИМ СЛИЯНИЕМ; координаты — build.upstream в module.json")
     a = ap.parse_args()
 
     # doctor — самостоятельная команда: ничего не собирает, только смотрит на хост.
@@ -1234,14 +1554,19 @@ def main():
         targets = list(ALL_OSES) if a.os in (None, "all") else [a.os]
         return 0 if cmd_doctor(targets, a.module) else 1
 
-    # package / bundle — не требуют Go (только копирование/zip); резолвим модуль и выходим.
-    if a.package or a.bundle:
+    # bump / test / package / bundle — самостоятельные команды над ОДНИМ модулем: резолвим его и
+    # выходим. package/bundle обходятся копированием и zip'ом, test нужен Go, bump — git.
+    if a.bump or a.test or a.package or a.bundle:
         mod = a.module
         if not mod and not a.yes:
             mod = ask_choice("Модуль", list(MODULES), next(iter(MODULES)))
         if mod not in MODULES:
             err(f"Неизвестный модуль: {mod}. Допустимо: {list(MODULES)}"); return 2
         okall = True
+        if a.bump:
+            okall = cmd_bump(mod, a.bump) and okall
+        if a.test:
+            okall = cmd_test(mod) and okall
         if a.package:
             okall = cmd_package(mod) and okall
         if a.bundle:

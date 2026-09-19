@@ -9,7 +9,6 @@ import (
 	"universal-bypass-tool/transport"
 )
 
-// protectedWSDialer routes its socket through transport.ProtectedDialer to avoid deadlocking under an Android VpnService.
 func protectedWSDialer() *websocket.Dialer {
 	return &websocket.Dialer{NetDialContext: transport.ProtectedDialer().DialContext}
 }

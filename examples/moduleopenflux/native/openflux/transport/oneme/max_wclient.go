@@ -108,7 +108,7 @@ func (c *MaxClient) LoginByToken(token string) error {
 	}
 	c.loggedIn = true
 	go c.keepalive()
-	// Contact names/phone numbers are never printed to stdout - it ends up in bug reports.
+	// AntiNet divergence from openflux-server: the account's contact list (names, phone numbers) is NOT printed. A helper's stdout is redirected by the host into `helper.stdout.log`, which people read and grep by hand and which goes into bug reports wholesale - third parties' phone numbers have no place in a VPN client's diagnostic log.
 	return nil
 }
 

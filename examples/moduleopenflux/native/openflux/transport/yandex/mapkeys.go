@@ -2,7 +2,9 @@ package yandex
 
 import "encoding/binary"
 
-// Ported from openflux-server's volga.go; yandex.go calls both even though Volga itself isn't ported.
+// Дословно из openflux-server, где обе функции лежат в `volga.go` — транспорт Volga в модуль не
+// портирован (см. README), но yandex.go зовёт их: `mapKeys` из диагностики `fetchDocInfo`,
+// `decodeBatch` из batchMarker-ветки handleMessage (multi-stream).
 
 func mapKeys(m map[string]interface{}) []string {
 	keys := make([]string, 0, len(m))

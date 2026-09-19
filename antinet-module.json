@@ -1,15 +1,15 @@
 {
-  "version": "1.1.0",
+  "version": "1.1.1",
   "android": {
-    "arm64-v8a": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1/openflux-android-arm64-v8a.zip",
-    "armeabi-v7a": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1/openflux-android-armeabi-v7a.zip",
-    "x86": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1/openflux-android-x86.zip",
-    "x86_64": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1/openflux-android-x86_64.zip"
+    "arm64-v8a": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1.1/openflux-android-arm64-v8a.zip",
+    "armeabi-v7a": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1.1/openflux-android-armeabi-v7a.zip",
+    "x86": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1.1/openflux-android-x86.zip",
+    "x86_64": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1.1/openflux-android-x86_64.zip"
   },
   "desktop": {
-    "windows_amd64": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1/openflux-windows_amd64.zip",
-    "linux_amd64": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1/openflux-linux_amd64.zip",
-    "darwin_amd64": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1/openflux-darwin_amd64.zip"
+    "windows_amd64": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1.1/openflux-windows_amd64.zip",
+    "linux_amd64": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1.1/openflux-linux_amd64.zip",
+    "darwin_amd64": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1.1/openflux-darwin_amd64.zip"
   },
-  "changelog": "1.1.0: handoverMode moved from restart to signal - the host now signals the running helper on a network change instead of killing and respawning it, so SOCKS5 sessions survive roaming; Yandex Docs/MAX transport resynced byte-for-byte with the current openflux-server fork (multi-stream batch framing, current transport/protect.go fixes); Android bundles now cover all 4 ABIs (arm64-v8a, armeabi-v7a, x86, x86_64) instead of two."
+  "changelog": "1.1.1: DNS resolver now refreshes from a new 'dns' host event instead of only at startup, so lookups stop timing out against a stale server list after roaming to a new network; socks5Udp explicitly declared false so hosts stop routing UDP/QUIC into this module; added pingWhileConnected; server-side transport/network code resynced with the current openflux-server fork."
 }
