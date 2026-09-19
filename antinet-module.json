@@ -1,15 +1,15 @@
 {
-  "version": "1.1.1",
+  "version": "1.1.2",
   "android": {
-    "arm64-v8a": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1.1/openflux-android-arm64-v8a.zip",
-    "armeabi-v7a": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1.1/openflux-android-armeabi-v7a.zip",
-    "x86": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1.1/openflux-android-x86.zip",
-    "x86_64": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1.1/openflux-android-x86_64.zip"
+    "arm64-v8a": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1.2/openflux-android-arm64-v8a.zip",
+    "armeabi-v7a": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1.2/openflux-android-armeabi-v7a.zip",
+    "x86": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1.2/openflux-android-x86.zip",
+    "x86_64": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1.2/openflux-android-x86_64.zip"
   },
   "desktop": {
-    "windows_amd64": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1.1/openflux-windows_amd64.zip",
-    "linux_amd64": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1.1/openflux-linux_amd64.zip",
-    "darwin_amd64": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1.1/openflux-darwin_amd64.zip"
+    "windows_amd64": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1.2/openflux-windows_amd64.zip",
+    "linux_amd64": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1.2/openflux-linux_amd64.zip",
+    "darwin_amd64": "https://github.com/wlruscfd/openflux-antinet-module/releases/download/v1.1.2/openflux-darwin_amd64.zip"
   },
-  "changelog": "1.1.1: DNS resolver now refreshes from a new 'dns' host event instead of only at startup, so lookups stop timing out against a stale server list after roaming to a new network; socks5Udp explicitly declared false so hosts stop routing UDP/QUIC into this module; added pingWhileConnected; server-side transport/network code resynced with the current openflux-server fork."
+  "changelog": "1.1.2: fixed a leaked socket + goroutine on every transport Stop() (a blocked read could keep a dead connection alive for up to a minute, and a handshake finishing after Stop() went live with nothing left to read it) - also fixes a node-wide connection-tracking leak on the exit-node side. 1.1.1: DNS resolver now refreshes from a new 'dns' host event instead of only at startup, so lookups stop timing out against a stale server list after roaming to a new network; socks5Udp explicitly declared false so hosts stop routing UDP/QUIC into this module; added pingWhileConnected; server-side transport/network code resynced with the current openflux-server fork."
 }

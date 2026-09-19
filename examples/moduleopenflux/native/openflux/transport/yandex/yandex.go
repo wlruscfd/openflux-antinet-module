@@ -204,6 +204,20 @@ func (t *YandexDocsTransport) Start() error {
 	return nil
 }
 
+// Stop closes the live session's socket, not just BaseTransport's flag: an in-flight ReadMessage()
+// blocks up to the ping window (tens of seconds) otherwise, leaking a goroutine and a socket per
+// stop under the churn a busy control plane produces (e.g. a quota-triggered worker restart).
+func (t *YandexDocsTransport) Stop() error {
+	t.BaseTransport.Stop()
+	t.Mu.Lock()
+	session := t.session
+	t.Mu.Unlock()
+	if session != nil && session.Conn != nil {
+		session.Conn.Close()
+	}
+	return nil
+}
+
 // Send doesn't require IsConnected(): a session's WriteQueue is reused across a reconnect so a brief drop can queue data instead of forcing the tunnel's own TCP to notice loss and retransmit.
 func (t *YandexDocsTransport) Send(data []byte) error {
 	t.Mu.RLock()
@@ -278,6 +292,13 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			utils.Debugf("[YDOCS] handshake failed: %v", err)
 			conn.Close()
 			t.scheduleReconnect(attempt, reasonHandshakeFailed, err)
+			return
+		}
+
+		if !t.IsRunning() {
+			// Stop() ran while this goroutine was still dialing/handshaking - closing here (rather
+			// than going live) is the only thing that would have closed this particular conn.
+			conn.Close()
 			return
 		}
 
