@@ -101,6 +101,11 @@ func (t *TCPTunnel) setupClient(tunnelNIC tcpip.NICID) {
 	})
 }
 
+// SetMTU overrides the tunnel virtual link's default 1500 - a caller relaying through a constrained real path (mobile network, a smaller TUN device MTU) should match it here too, or gvisor keeps building segments this link can't actually get through.
+func (t *TCPTunnel) SetMTU(mtu uint32) {
+	t.tunnelEP.SetMTU(mtu)
+}
+
 // DialTCP — дозвон ВНУТРИ туннеля. `address` обязан быть литеральным `ip:port` (IPv4): резолв —
 // обязанность вызывающего, его protected off-tunnel резолвером (MODULE_API §2.3 п.2), иначе
 // резолв-сокет уходит в TUN. Дедлайн берётся из ctx — стек gVisor сам по себе не сдаётся никогда.

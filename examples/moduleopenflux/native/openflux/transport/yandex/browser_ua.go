@@ -2,8 +2,8 @@ package yandex
 
 import "net/http"
 
-// browserUserAgent is a real, currently-plausible Firefox fingerprint; a convincing header set can't fix IP-reputation challenges, but an otherwise bare request (User-Agent only) was itself a detectable tell.
-const browserUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0"
+// Deliberately bare/vague, not a specific version - a convincing version string is what triggers Yandex's CAPTCHA on a datacenter IP, confirmed by testing.
+const browserUserAgent = "Mozilla/5.0"
 
 // applyBrowserGetHeaders deliberately skips Accept-Encoding (would disable Go's transparent decompression) and Chromium-only Sec-Ch-Ua hints (a Firefox UA sending them is a bigger tell than sending neither).
 func applyBrowserGetHeaders(h http.Header) {

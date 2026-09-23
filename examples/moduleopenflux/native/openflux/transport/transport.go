@@ -31,6 +31,8 @@ const (
 	EventConnecting = "connecting"
 	EventConnected  = "connected"
 	EventRetrying   = "retrying"
+	// EventCaptchaRequired's detail is the doc_url that needs solving.
+	EventCaptchaRequired = "captcha_required"
 )
 
 type TransportStats struct {
@@ -46,8 +48,8 @@ type TransportStats struct {
 func DefaultConfig() TransportConfig {
 	return TransportConfig{
 		MaxReconnectAttempts: 999999,
-		// Must stay nonzero: 0 makes the exponential backoff a permanent no-op, since 0 * anything is still 0.
-		ReconnectDelay:      500 * time.Millisecond,
+		// 1.5s floor, not lower: upstream (p1neappleXpress/OpenFlux@47b151f) found every WS reconnect registers as a fresh participant on Yandex's side regardless of our own userID reuse - a tighter floor just piles up ghost participants faster during a failure streak. Must stay nonzero either way: 0 makes the exponential backoff a permanent no-op, since 0 * anything is still 0.
+		ReconnectDelay:      1500 * time.Millisecond,
 		ReconnectMultiplier: 1.6,
 		MaxReconnectDelay:   30 * time.Second,
 		MaxQueueSize:        1024,
