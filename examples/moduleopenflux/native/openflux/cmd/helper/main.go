@@ -110,7 +110,7 @@ type ofStrings struct {
 	transportUpFmt          string // %s — номер попытки
 	captchaWindowTitle      string
 	captchaWindowText       string
-	captchaNoHostSupportLog string
+	captchaNoHostSupportFmt string // %s — что объявил хост
 	captchaClosedLog        string
 	captchaNoCookiesLog     string
 	captchaGotCookiesLog    string
@@ -134,9 +134,9 @@ var ofStringsRU = ofStrings{
 	transportUpFmt:          "OpenFlux: транспорт поднят (попытка %s)",
 	captchaWindowTitle:      "Проверка Яндекса",
 	captchaWindowText:       "Пройдите проверку в этом окне — оно закроется само, когда проверка будет пройдена.",
-	captchaNoHostSupportLog: "OpenFlux: хост не объявил webview.cookies — окно проверки использовать нечем, переключите «Проверка Яндекса» в режим auto",
+	captchaNoHostSupportFmt: "OpenFlux: хост не объявил ни webview.cookies, ни webview.bridge (объявлено: %s) — окно проверки не сможет вернуть cookie, обновите AntiNet",
 	captchaClosedLog:        "OpenFlux: окно проверки закрыто без результата",
-	captchaNoCookiesLog:     "OpenFlux: окно проверки не вернуло cookie",
+	captchaNoCookiesLog:     "OpenFlux: окно проверки не вернуло cookie — хост не отдал их ответом, обновите AntiNet",
 	captchaGotCookiesLog:    "OpenFlux: cookie из окна проверки получены, переподключаю транспорт",
 }
 
@@ -158,9 +158,9 @@ var ofStringsEN = ofStrings{
 	transportUpFmt:          "OpenFlux: transport is up (attempt %s)",
 	captchaWindowTitle:      "Yandex check",
 	captchaWindowText:       "Pass the check in this window - it closes by itself once the check is passed.",
-	captchaNoHostSupportLog: "OpenFlux: the host does not declare webview.cookies - the check window is useless, switch the Yandex check setting to auto",
+	captchaNoHostSupportFmt: "OpenFlux: the host declares neither webview.cookies nor webview.bridge (declared: %s) - the check window cannot return cookies, update AntiNet",
 	captchaClosedLog:        "OpenFlux: the check window was closed without a result",
-	captchaNoCookiesLog:     "OpenFlux: the check window returned no cookies",
+	captchaNoCookiesLog:     "OpenFlux: the check window returned no cookies - the host did not hand them back, update AntiNet",
 	captchaGotCookiesLog:    "OpenFlux: cookies from the check window received, reconnecting the transport",
 }
 
@@ -478,7 +478,9 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 
 	cfg := parseConfig(configContent)
 	s := ofStringsFor(cfg["APP_LANG"])
-	ofText = s          // §2.9: текст для юзера — на языке AntiNet
+	ofText = s
+	hostFeaturesRaw = cfg["HOST_FEATURES"]
+	log.Printf("host features: %q", hostFeaturesRaw)          // §2.9: текст для юзера — на языке AntiNet
 	port, _ := strconv.Atoi(cfg["LISTEN_PORT"]) // 0 = эфемерный (ядро выберет)
 	user := cfg["SOCKS_USER"]
 	pass := cfg["SOCKS_PASS"]
@@ -944,31 +946,69 @@ var captchaWindowMu sync.Mutex
 // вовсе без cookie — тихий сбой без единой ошибки.
 //
 // Второй аргумент — `cancelled`: различать «человек закрыл окно» и «окно не дало cookie».
+var hostFeaturesRaw string
+
+func hostFeaturesDeclared() bool { return strings.TrimSpace(hostFeaturesRaw) != "" }
+
+// hostCan — хост может исполнить возможность. Хост, который HOST_FEATURES не присылает вовсе, —
+// старый: он мог поддерживать поле и без объявления, поэтому пробуем, а не отказываем заранее.
+func hostCan(feature string) bool { return !hostFeaturesDeclared() || hostSupports(feature) }
+
+// Запасной путь для хоста без webview.cookies: JS в окне сам отдаёт document.cookie (без HttpOnly)
+// через мост window.antinet, когда страница ушла с проверки.
+const captchaBridgeJS = `(function(){var sent=false;function tick(){if(sent||document.readyState!=="complete")return;` +
+	`if(/showcaptcha|captcha|passport\.yandex/.test(location.href))return;` +
+	`if(window.antinet&&window.antinet.submit){sent=true;window.antinet.submit({cookie:document.cookie,url:location.href});}}` +
+	`setInterval(tick,700);})();`
+
+func cookiesFromBridgeValue(res string) map[string]string {
+	env := actionResultEnvelope(res)
+	var obj map[string]any
+	switch v := env["value"].(type) {
+	case map[string]any:
+		obj = v
+	case string:
+		_ = json.Unmarshal([]byte(v), &obj)
+	}
+	raw, _ := obj["cookie"].(string)
+	jar := map[string]string{}
+	for _, part := range strings.Split(raw, ";") {
+		if name, value, ok := strings.Cut(strings.TrimSpace(part), "="); ok && name != "" {
+			jar[name] = value
+		}
+	}
+	return jar
+}
+
 func solveCaptchaByWebView(profileDir, docURL string) (string, bool) {
-	if !hostSupports("webview.cookies") {
-		// ⛔ Раньше здесь был молчаливый return, и это стоило диагностики: хост не умеет
-		// отдавать HttpOnly-куки, окно всё равно было бы бесполезным, но модуль об этом
-		// не говорил ни слова — выглядело как «ничего не происходит».
-		emitLog(ofText.captchaNoHostSupportLog)
+	nativeCookies := hostCan("webview.cookies")
+	bridge := hostCan("webview.bridge")
+	if !nativeCookies && !bridge {
+		declared := hostFeaturesRaw
+		emitLog(ofText.captchaNoHostSupportFmt, declared)
 		return "", false
 	}
 	ids := fmt.Sprintf("of-captcha-%d", time.Now().UnixNano())
 	rule := map[string]any{
-		"type":           "webview",
-		"title":          ofText.captchaWindowTitle,
-		"text":           ofText.captchaWindowText,
-		"url":            docURL,
-		"userAgent":      yandex.BrowserUserAgent(),
-		"collectCookies": true,
+		"type":      "webview",
+		"title":     ofText.captchaWindowTitle,
+		"text":      ofText.captchaWindowText,
+		"url":       docURL,
+		"userAgent": yandex.BrowserUserAgent(),
 	}
-	if hostSupports("webview.leavePattern") {
-		// Страница, которая вернула человека к проверке, успехом не считается.
+	if nativeCookies {
+		rule["collectCookies"] = true
+	}
+	if bridge {
+		rule["injectJs"] = captchaBridgeJS
+	}
+	if hostCan("webview.leavePattern") {
 		rule["leavePattern"] = []string{"showcaptcha", "passport.yandex"}
 	}
-	if hostSupports("webview.doneButton") {
+	if hostCan("webview.doneButton") {
 		rule["doneButton"] = true
 	}
-	if hostSupports("webview.loadBudget") {
+	if hostCan("webview.loadBudget") {
 		rule["urlTimeoutSec"] = captchaLoadBudgetSec
 	}
 	res, cancelled := runAction(profileDir, ids, rule)
@@ -976,6 +1016,9 @@ func solveCaptchaByWebView(profileDir, docURL string) (string, bool) {
 		return "", true
 	}
 	jar := actionResultCookieJar(res)
+	if len(jar) == 0 {
+		jar = cookiesFromBridgeValue(res)
+	}
 	return cookieHeader(jar), false
 }
 

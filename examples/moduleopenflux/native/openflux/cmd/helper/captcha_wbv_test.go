@@ -255,7 +255,7 @@ func captureStdout(t *testing.T) (lines chan string, restore func()) {
 }
 
 func TestWebviewActionIsEmittedAndCookiesAreCollected(t *testing.T) {
-	rememberHostFeatures("webview.cookies,webview.leavePattern,webview.doneButton")
+	setTestHostFeatures("webview.cookies,webview.leavePattern,webview.doneButton")
 	ofText = ofStringsEN
 	lines, restore := captureStdout(t)
 	defer restore()
@@ -319,7 +319,7 @@ func TestWebviewActionIsEmittedAndCookiesAreCollected(t *testing.T) {
 }
 
 func TestWebviewActionCancelledByHost(t *testing.T) {
-	rememberHostFeatures("webview.cookies")
+	setTestHostFeatures("webview.cookies")
 	lines, restore := captureStdout(t)
 	defer restore()
 
@@ -351,7 +351,7 @@ func TestWebviewActionCancelledByHost(t *testing.T) {
 }
 
 func TestWebviewActionSkippedWhenHostCannotReturnCookies(t *testing.T) {
-	rememberHostFeatures("")
+	setTestHostFeatures("webview.leavePattern,webview.doneButton")
 	lines, restore := captureStdout(t)
 	jar, cancelled := solveCaptchaByWebView(t.TempDir(), "https://docs.yandex.ru/x")
 	restore()
@@ -405,7 +405,7 @@ func TestCancelledWindowExitsOnlyBeforeTheSessionIsUp(t *testing.T) {
 }
 
 func TestWebviewRuleAsksForALoadBudgetWhenTheHostKnowsIt(t *testing.T) {
-	rememberHostFeatures("webview.cookies,webview.loadBudget")
+	setTestHostFeatures("webview.cookies,webview.loadBudget")
 	ofText = ofStringsEN
 	lines, restore := captureStdout(t)
 	defer restore()
@@ -430,5 +430,90 @@ func TestWebviewRuleAsksForALoadBudgetWhenTheHostKnowsIt(t *testing.T) {
 	}
 	if _, has := rule["leavePattern"]; has {
 		t.Fatal("leavePattern must not be sent when the host did not declare it")
+	}
+}
+
+func setTestHostFeatures(csv string) {
+	rememberHostFeatures(csv)
+	hostFeaturesRaw = csv
+}
+
+func readRule(t *testing.T, lines chan string) (id string, rule map[string]any) {
+	t.Helper()
+	deadline := time.After(3 * time.Second)
+	for rule == nil {
+		select {
+		case line := <-lines:
+			if _, rest, ok := strings.Cut(line, "ACTION_REQUIRED|"); ok {
+				var payload string
+				id, payload, _ = strings.Cut(rest, "|")
+				raw, _ := base64.StdEncoding.DecodeString(payload)
+				_ = json.Unmarshal(raw, &rule)
+			}
+		case <-deadline:
+			t.Fatal("no ACTION_REQUIRED marker")
+		}
+	}
+	return id, rule
+}
+
+func TestUnannouncedHostIsTriedWithTheFullRule(t *testing.T) {
+	setTestHostFeatures("")
+	ofText = ofStringsEN
+	lines, restore := captureStdout(t)
+	defer restore()
+	go solveCaptchaByWebView(t.TempDir(), "https://docs.yandex.ru/x")
+
+	_, rule := readRule(t, lines)
+	for _, key := range []string{"collectCookies", "injectJs", "leavePattern", "doneButton"} {
+		if _, ok := rule[key]; !ok {
+			t.Fatalf("an old host that announces nothing must still get %q: %v", key, rule)
+		}
+	}
+}
+
+func TestDeclaredHostWithOnlyTheBridgeGetsTheBridgeFallback(t *testing.T) {
+	setTestHostFeatures("webview.bridge,webview.doneButton")
+	ofText = ofStringsEN
+	lines, restore := captureStdout(t)
+	defer restore()
+
+	done := make(chan string, 1)
+	go func() {
+		jar, _ := solveCaptchaByWebView(t.TempDir(), "https://docs.yandex.ru/x")
+		done <- jar
+	}()
+	id, rule := readRule(t, lines)
+	if _, ok := rule["collectCookies"]; ok {
+		t.Fatalf("collectCookies must not be asked of a host that did not declare it: %v", rule)
+	}
+	if js, _ := rule["injectJs"].(string); !strings.Contains(js, "window.antinet.submit") {
+		t.Fatalf("injectJs = %v", rule["injectJs"])
+	}
+	if _, ok := rule["leavePattern"]; ok {
+		t.Fatal("undeclared leavePattern must be left out")
+	}
+
+	answer := `{"type":"webview","value":"{\"cookie\":\"spravka=1; Session_id=abc\",\"url\":\"https://docs.yandex.ru/x\"}"}`
+	handleHostEvent("ACTION_RESULT|" + id + "|" + base64.StdEncoding.EncodeToString([]byte(answer)))
+	select {
+	case jar := <-done:
+		if jar != "Session_id=abc; spravka=1" {
+			t.Fatalf("jar = %q", jar)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no return after the bridge answer")
+	}
+}
+
+func TestBridgeValueAsObjectAndGarbage(t *testing.T) {
+	obj := `{"type":"webview","value":{"cookie":"a=1; b=2"}}`
+	if got := cookieHeader(cookiesFromBridgeValue(obj)); got != "a=1; b=2" {
+		t.Fatalf("object value: %q", got)
+	}
+	for _, bad := range []string{"", "not json", `{"value":"{"}`, `{"value":7}`} {
+		if got := cookiesFromBridgeValue(bad); len(got) != 0 {
+			t.Fatalf("%q must yield no cookies, got %v", bad, got)
+		}
 	}
 }
