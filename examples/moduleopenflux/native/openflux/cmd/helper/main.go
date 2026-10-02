@@ -16,7 +16,9 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -345,6 +347,32 @@ func (l openFluxLink) server() string {
 	return host
 }
 
+func shortHash(parts ...string) string {
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
+	return hex.EncodeToString(sum[:8])
+}
+
+// accountID — канал на стороне сервера, который занимает ссылка: тот же документ (или тот же
+// собеседник MAX) — одна «учётка», и хост не держит двух живых сессий на неё, то есть пинг не
+// ломает уже подключённый канал (MODULE_API §2.2).
+func (l openFluxLink) accountID() string {
+	if l.Transport == transportOneMe {
+		return shortHash(l.Transport, strconv.FormatInt(l.UID, 10))
+	}
+	urls := l.URLs
+	if len(urls) == 0 {
+		urls = []string{l.URL}
+	}
+	return shortHash(append([]string{l.Transport}, urls...)...)
+}
+
+// sessionID — отпечаток всего, чем helper пользуется из ссылки: ссылки с равным отпечатком работают
+// одинаково (различаются только именем), и одна живая сессия обслуживает обе. Хешируется, чтобы
+// токен ключа не попал в журналы хоста.
+func (l openFluxLink) sessionID() string {
+	return shortHash(l.accountID(), l.Token, l.KeyToken, strconv.FormatBool(l.E2E))
+}
+
 // displayName — имя для карточки: фрагмент ссылки, иначе — осмысленный дефолт по транспорту.
 func (l openFluxLink) displayName() string {
 	if l.Name != "" {
@@ -429,7 +457,7 @@ func moduleCall(verb, arg string) string {
 		if err != nil {
 			return "\n" // чужая схема/битая ссылка — две пустые строки, хост оставит плейсхолдер
 		}
-		return l.displayName() + "\n" + l.server()
+		return l.displayName() + "\n" + l.server() + "\n" + l.sessionID() + "\n" + l.accountID()
 	case "normalize":
 		return normalizeOpenFlux(arg)
 	}
@@ -623,6 +651,7 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	}
 	actualPort := ln.Addr().(*net.TCPAddr).Port
 
+	sessionReady.Store(true)
 	if err := writeReady(profileDir, actualPort); err != nil {
 		emitLog(s.writeReadyFailedFmt, err)
 		emitStatus(statusFatal, "write ready marker failed")
@@ -939,6 +968,9 @@ func solveCaptchaByWebView(profileDir, docURL string) (string, bool) {
 	if hostSupports("webview.doneButton") {
 		rule["doneButton"] = true
 	}
+	if hostSupports("webview.loadBudget") {
+		rule["urlTimeoutSec"] = captchaLoadBudgetSec
+	}
 	res, cancelled := runAction(profileDir, ids, rule)
 	if cancelled {
 		return "", true
@@ -977,12 +1009,20 @@ func cookieHeader(jar map[string]string) string {
 //
 // provider передаётся ЯВНО, а не достаётся проверкой типа из `trans`: обёртки Transport не поднимают
 // ProvideCookies, и проверка типа на обёртке молча вернула бы false.
+const captchaLoadBudgetSec = 60
+
 const (
 	captchaWindowCooldown = 5 * time.Minute
 	retryReasonCaptcha    = "captcha"
 )
 
 var captchaWindow = solveCaptchaByWebView
+
+var sessionReady atomic.Bool
+
+// Отмена окна на пути подключения — отказ человека (MODULE_API §2.7): выходим, не поднимая туннель,
+// и хост выбирает следующий конфиг; на живой сессии отмена её не рвёт.
+var exitOnCancelledCheck = func() { log.Fatalf("captcha window cancelled by the user before the session was up") }
 
 func attachCaptchaSolver(trans transport.Transport, provider transport.CookieProvider, profileDir string, mode captchaMode) {
 	solve := mode != captchaOff && provider != nil
@@ -1010,6 +1050,9 @@ func attachCaptchaSolver(trans transport.Transport, provider transport.CookiePro
 				mu.Unlock()
 				if cancelled {
 					emitLog(ofText.captchaClosedLog)
+					if !sessionReady.Load() {
+						exitOnCancelledCheck()
+					}
 				} else {
 					emitLog(ofText.captchaNoCookiesLog)
 				}

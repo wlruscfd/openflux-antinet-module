@@ -106,8 +106,8 @@ func TestPlainLinkForms(t *testing.T) {
 }
 
 func TestSummarizeAndNormalize(t *testing.T) {
-	got := moduleCall("summarize", importLink(t, map[string]any{"name": "Home", "doc_url": "https://mts-link.example/board/1", "transport": "mts"}))
-	if got != "Home\nmts-link.example" {
+	got := strings.Split(moduleCall("summarize", importLink(t, map[string]any{"name": "Home", "doc_url": "https://mts-link.example/board/1", "transport": "mts"})), "\n")
+	if len(got) != 4 || got[0] != "Home" || got[1] != "mts-link.example" || got[2] == "" || got[3] == "" {
 		t.Fatalf("summarize = %q", got)
 	}
 	if moduleCall("summarize", "garbage") != "\n" {
@@ -202,3 +202,28 @@ func TestE2EOnlyWhenKeyPresent(t *testing.T) {
 }
 
 func typeName(v any) string { return fmt.Sprintf("%T", v) }
+
+func TestSummarizeSessionAndAccount(t *testing.T) {
+	line := func(payload map[string]any) []string {
+		return strings.Split(moduleCall("summarize", importLink(t, payload)), "\n")
+	}
+	a := line(map[string]any{"name": "A", "doc_url": "https://docs.yandex.ru/x", "key_token": "k1", "e2e_encryption": true})
+	b := line(map[string]any{"name": "B", "doc_url": "https://docs.yandex.ru/x", "key_token": "k1", "e2e_encryption": true})
+	other := line(map[string]any{"name": "A", "doc_url": "https://docs.yandex.ru/y", "key_token": "k1", "e2e_encryption": true})
+	rekeyed := line(map[string]any{"name": "A", "doc_url": "https://docs.yandex.ru/x", "key_token": "k2", "e2e_encryption": true})
+
+	if a[2] != b[2] || a[3] != b[3] {
+		t.Fatalf("a rename must not change session/account: %v vs %v", a, b)
+	}
+	if a[3] == other[3] || a[2] == other[2] {
+		t.Fatal("a different document is a different account and session")
+	}
+	if a[3] != rekeyed[3] || a[2] == rekeyed[2] {
+		t.Fatal("same document with another key: same account, different session")
+	}
+	for _, field := range a[2:] {
+		if strings.Contains(field, "k1") {
+			t.Fatal("the key token must not leak into the summary")
+		}
+	}
+}

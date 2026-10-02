@@ -204,6 +204,8 @@ func TestOffModeAndMissingProviderNeverOpenWindow(t *testing.T) {
 
 func TestCancelledWindowIsNotReopenedOnEveryRetry(t *testing.T) {
 	opened := withFakeWindow(t, "", true)
+	stubExit(t)
+	sessionReady.Store(true)
 	tr := &fakeCaptchaTransport{reconnects: make(chan struct{}, 1)}
 	attachCaptchaSolver(tr, &fakeCookieProvider{got: make(chan string, 1)}, t.TempDir(), captchaAuto)
 	tr.cb(transport.EventCaptchaRequired, "https://docs.yandex.ru/x")
@@ -360,5 +362,73 @@ func TestWebviewActionSkippedWhenHostCannotReturnCookies(t *testing.T) {
 		if strings.Contains(line, "ACTION_REQUIRED") {
 			t.Fatal("a window that cannot return cookies must not be requested")
 		}
+	}
+}
+
+func stubExit(t *testing.T) chan struct{} {
+	t.Helper()
+	exited := make(chan struct{}, 4)
+	prev := exitOnCancelledCheck
+	exitOnCancelledCheck = func() { exited <- struct{}{} }
+	t.Cleanup(func() { exitOnCancelledCheck = prev; sessionReady.Store(false) })
+	return exited
+}
+
+func TestCancelledWindowExitsOnlyBeforeTheSessionIsUp(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		ready     bool
+		wantExits bool
+	}{{"connect path", false, true}, {"live session", true, false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			opened := withFakeWindow(t, "", true)
+			exited := stubExit(t)
+			sessionReady.Store(tc.ready)
+
+			tr := &fakeCaptchaTransport{reconnects: make(chan struct{}, 1)}
+			attachCaptchaSolver(tr, &fakeCookieProvider{got: make(chan string, 1)}, t.TempDir(), captchaWebviewOnly)
+			tr.cb(transport.EventCaptchaRequired, "https://docs.yandex.ru/x")
+			expectOpen(t, opened, true)
+
+			select {
+			case <-exited:
+				if !tc.wantExits {
+					t.Fatal("a live session must survive a cancelled window")
+				}
+			case <-time.After(300 * time.Millisecond):
+				if tc.wantExits {
+					t.Fatal("a cancelled window on the connect path must exit so the host can pick another config")
+				}
+			}
+		})
+	}
+}
+
+func TestWebviewRuleAsksForALoadBudgetWhenTheHostKnowsIt(t *testing.T) {
+	rememberHostFeatures("webview.cookies,webview.loadBudget")
+	ofText = ofStringsEN
+	lines, restore := captureStdout(t)
+	defer restore()
+	go solveCaptchaByWebView(t.TempDir(), "https://docs.yandex.ru/x")
+
+	var rule map[string]any
+	deadline := time.After(3 * time.Second)
+	for rule == nil {
+		select {
+		case line := <-lines:
+			if _, rest, ok := strings.Cut(line, "ACTION_REQUIRED|"); ok {
+				_, payload, _ := strings.Cut(rest, "|")
+				raw, _ := base64.StdEncoding.DecodeString(payload)
+				_ = json.Unmarshal(raw, &rule)
+			}
+		case <-deadline:
+			t.Fatal("no ACTION_REQUIRED marker")
+		}
+	}
+	if rule["urlTimeoutSec"] != float64(captchaLoadBudgetSec) {
+		t.Fatalf("rule = %v", rule)
+	}
+	if _, has := rule["leavePattern"]; has {
+		t.Fatal("leavePattern must not be sent when the host did not declare it")
 	}
 }

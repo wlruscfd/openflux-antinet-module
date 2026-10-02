@@ -28,6 +28,7 @@ build.py — ЕДИНЫЙ сборщик helper-бинарей протокол-
 установленной. Для android — ещё Android NDK (как у tools/build-module.py).
 """
 import argparse
+import functools
 import json
 import os
 import platform
@@ -45,15 +46,29 @@ for _s in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-HERE = Path(__file__).resolve().parent  # module_system/
-REPO = HERE.parent                       # корень AntiNet-репозитория
+HERE = Path(__file__).resolve().parent  # module_system/ — либо корень авторского архива
+# Корень раскладки, от которого отсчитываются пути модулей и запускается git. В репозитории AntiNet
+# сборщик лежит в `module_system/`, и корень — родитель. В авторском архиве он лежит В КОРНЕ
+# (`examples/` рядом с ним), и родитель — посторонний каталог, чаще всего вообще не репозиторий.
+# ⛔ Безусловный `HERE.parent` ломал у автора именно то, что незаметно: `--package` не находил git
+# («не репозиторий» на уровень выше) и молча уходил на грубые шаблоны, то есть в архив уезжало всё,
+# что автор игнорит, — а в логе стояло одно слово «git недоступен».
+REPO = HERE.parent if HERE.name == "module_system" else HERE
 IS_WIN = os.name == "nt"
 # Обзор системы (тулчейн, быстрый старт, публикация) — ОДИН документ, но имя у него зависит от
 # раскладки: в репозитории это `module_system/README.md`, в авторском архиве он едет под именем
 # `MODULE_SYSTEM.md`, потому что корневой README.md там занят точкой входа автора (cmd_package).
 # Рантайм-сообщения обязаны называть тот файл, который у читателя реально есть, иначе `--doctor`
 # в архиве отправляет автора к несуществующему пути.
-SYSTEM_DOC = "MODULE_SYSTEM.md" if (HERE / "MODULE_SYSTEM.md").exists() else "module_system/README.md"
+# ⛔ ФАЙЛ, а не только имя: `cmd_package` копирует обзор в архив, и брать его «из README.md рядом»
+# нельзя — при выкладке из РАСПАКОВАННОГО архива (автор собирает свой релиз тем же build.py)
+# README.md это точка входа ЕГО модуля, и обзор системы молча подменялся ею. Поймано сверкой
+# архивов по хешам: `MODULE_SYSTEM.md` у csqtt содержал «Модуль CSQTT для AntiNet» под шапкой
+# «Копия module_system/README.md».
+SYSTEM_DOC_FILE = HERE / "MODULE_SYSTEM.md"
+if not SYSTEM_DOC_FILE.exists():
+    SYSTEM_DOC_FILE = HERE / "README.md"
+SYSTEM_DOC = SYSTEM_DOC_FILE.name if SYSTEM_DOC_FILE.name != "README.md" else "module_system/README.md"
 SHARED_OFFTUN = HERE / "shared" / "offtun"  # канон off-TUN socket-protect + десктопные protect-адаптеры, всегда
 SHARED_PROTECT = HERE / "shared" / "protect"  # канон клиента protect-сервиса (Android), инжектируется всегда
 SHARED_SOCKS5 = HERE / "shared" / "socks5"  # канон SOCKS5-протокола целиком (socks5:true)
@@ -119,6 +134,10 @@ def load_modules():
             "bin": d["helperBinary"]["desktop"],                    # desktop-бинарь (без расширения)
             "descriptor": d,                                        # полный дескриптор (для dist/<target>/module.json)
             "actbin": None,                                         # desktop actionBinary (UI-действие, §2.7) — cgo
+            # Доп. нативные библиотеки рядом с helper'ом (§2.4): движок на другом языке, который
+            # helper грузит `dlopen`'ом. Сборщик их НЕ собирает (чужой тулчейн — чужая команда), но
+            # обязан довезти и обязан отказаться собирать релиз без них.
+            "nativelibs": b.get("nativeLibs") or {},
         }
         ab = d.get("actionBinary")                                  # опц.: {desktop, goDir, goPkg} — webview-EXE и т.п.
         if ab and ab.get("desktop"):
@@ -132,12 +151,13 @@ def load_modules():
 
 MODULES = load_modules()
 
-# Эталонный модуль: ЕГО архив несёт полный комплект доков модульной системы (контракт,
-# внутренности хоста, обзор с тулчейном) и служит стартовой точкой тому, кто пишет СВОЙ модуль.
-# Архивы остальных — авторская поставка: исходники модуля + каноны + сборка, без нашего SDK.
-# Здесь константой, а не «if mod == 'echo'» по коду: точка одна, и переезд эталона на другой
-# модуль не требует искать разбросанные сравнения.
-DOCS_REFERENCE_MODULE = "echo"
+# Эталонный модуль: ЕГО архив клиент возит с собой (Android-ассет, ресурс Desktop-GUI, копия рядом
+# с Desktop-бинарём) как стартовый пример «напиши свой модуль», и его же синхронизирует
+# `tools/sync_reference_archive.py` — единственный потребитель этой константы.
+# ⛔ К комплекту ДОКОВ отношения не имеет: контракт, `PORTING.md` и `MODULE_SYSTEM.md` едут в
+# КАЖДЫЙ архив (см. `_docs_rows`). Развилка «доки только эталону» здесь была и стоила расходящихся
+# копий контракта у авторов.
+REFERENCE_MODULE = "echo"
 
 def android_abi_list():
     """Канонический список Android-ABI — ЧИТАЕТСЯ из `tools/build-module.py` (`ABI_MAP`), а не
@@ -282,9 +302,12 @@ def c(txt, code):
     return f"\033[{code}m{txt}\033[0m" if sys.stdout.isatty() else txt
 
 
-def info(m): print(c("• ", "36") + m)
-def ok(m):   print(c("✓ ", "32") + m)
-def err(m):  print(c("✗ ", "31") + m, file=sys.stderr)
+# `flush=True` во всех трёх: `err` пишет в stderr, остальные в stdout, и при перенаправлении в
+# файл (`> build.log 2>&1` — первое, что делает автор модуля, когда сборка отказала) потоки
+# буферизуются по-разному. Без сброса отказ всплывает в логе раньше строк, которые его объясняют.
+def info(m): print(c("• ", "36") + m, flush=True)
+def ok(m):   print(c("✓ ", "32") + m, flush=True)
+def err(m):  print(c("✗ ", "31") + m, file=sys.stderr, flush=True)
 
 
 def ask(prompt, default=None):
@@ -458,11 +481,6 @@ def check_toolchain(targets, mod=None, abis="arm64-v8a", api=26):
             problems.append(("Android NDK (переменная ANDROID_NDK_HOME / ANDROID_HOME/ndk/<ver>)",
                              INSTALL_HINTS["ndk"][HOST_OS]))
         else:
-            # Проверяем НЕ ТОЛЬКО корень NDK. Прерванная установка (например, sdkmanager
-            # прервали) оставляет каталог с одним лишь `.installer`, и старая проверка рапортовала
-            # «NDK есть», после чего сборка android падала, а в dist оставался ПРЕЖНИЙ .so — то
-            # есть релиз уходил с немолчащим устаревшим бинарём. Каталог с clang'ом и есть
-            # то, чем на самом деле пользуется сборка.
             ndk_bin = Path(ndk) / "toolchains" / "llvm" / "prebuilt" / f"{HOST_OS}-x86_64" / "bin"
             clang = next(ndk_bin.glob("*-linux-android*-clang"), None) if ndk_bin.is_dir() else None
             if clang is None:
@@ -503,15 +521,58 @@ def report_toolchain(problems):
     return False
 
 
-def cmd_doctor(targets, mod):
+def report_native_libs(mod, targets, arch):
+    """Доп. библиотеки модуля (§2.4) ПО КАЖДОЙ ЦЕЛИ: что объявлено и лежит ли оно.
+
+    Их тулчейн сборщику неизвестен, поэтому вопрос не «есть ли cargo», а «лежит ли результат»:
+    именно этого не хватало, когда `--doctor` рапортовал «всё на месте» модулю, чей движок
+    собирается отдельно и не был собран вовсе.
+
+    ⛔ Цели перебираются ПОИМЁННО (все ABI, каждая desktop-ОС), а не одной строкой на платформу:
+    библиотека платформенная и АРХИТЕКТУРНАЯ, «под android есть» ничего не говорит про
+    `armeabi-v7a`, а собранный без неё ABI-бандл ставится молча и падает на устройстве.
+    Возвращает False, если хоть под одну запрошенную цель объявленного файла нет."""
+    nl = MODULES.get(mod, {}).get("nativelibs") or {}
+    if not nl:
+        return True
+    print()
+    info("Доп. библиотеки модуля (собираются отдельно, сборщик их только довозит):")
+    jobs = [("android", {"abi": abi}) for abi in android_abi_list() if "android" in targets]
+    jobs += [("desktop", {"os": o, "arch": arch}) for o in DESKTOP_OSES if o in targets]
+    complete = True
+    for kind, fmt in jobs:
+        libs = native_libs_resolved(mod, kind, **fmt)
+        if libs is None:                      # дескриптор отвергнут — причина уже напечатана
+            return False
+        target = native_libs_sections(kind, **fmt)[0]
+        if not libs:
+            info(f"  {target}: не объявлено")
+            continue
+        for name, rel, _src, exists in libs:
+            if exists:
+                ok(f"  {target}: {name} ← {rel}")
+            else:
+                err(f"  {target}: НЕТ {name} ← {rel}")
+                complete = False
+    if hint := nl.get(NATIVELIB_HINT_KEY):
+        info(f"  как собрать: {hint}")
+    return complete
+
+
+def cmd_doctor(targets, mod, arch="amd64"):
     print(c("=== Проверка тулчейна ===", "1;36"))
     info(f"Хост: {HOST_OS} · цели: {targets}" + (f" · модуль: {mod}" if mod else ""))
     print()
     problems = check_toolchain(targets, mod)
-    if report_toolchain(problems):
+    libs_ok = report_native_libs(mod, targets, arch) if mod else True
+    if report_toolchain(problems) and libs_ok:
         print()
         ok("Всё на месте — можно собирать.")
         return True
+    if libs_ok:
+        return False
+    print()
+    err("Часть объявленных библиотек не собрана — сборка этих целей откажется работать.")
     return False
 
 
@@ -606,10 +667,143 @@ def build_desktop(go, mod, goos, goarch):
         if isrc.exists():
             shutil.copy2(str(isrc), str(out.parent / inst))
             ok(f"[{mod}/{goos}_{goarch}] installer → {inst}")
+    if not stage_native_libs(mod, "desktop", out.parent, os=goos, arch=goarch):
+        return False
     return True
 
 
 # ⛔ Цели `wasm` (GOOS=wasip1) нет — см. MODULE_API.md §2.12.
+
+
+# Расширение разделяемой библиотеки по ОС — подставляется как `{dlext}`. Оно и есть причина, по
+# которой одна секция не накрывает все цели: файл движка зовётся `libX.so` на Linux и Android,
+# `libX.dll` на Windows, `libX.dylib` на macOS, и объявлять его надо ПОД КАЖДУЮ цель отдельно.
+DL_EXT = {"android": ".so", "linux": ".so", "windows": ".dll", "darwin": ".dylib"}
+
+# Ключ секции `nativeLibs` — это путь цели в `dist/` с отброшенным хвостом. Отсюда и написания, и
+# их порядок: ни одна платформа не обделена уточнением, и читается ключ одинаково на обеих.
+NATIVELIB_HINT_KEY = "hint"
+
+
+def native_libs_sections(kind, **fmt):
+    """Ключи секций `nativeLibs`, применимые к ОДНОЙ цели, — от самой узкой к самой широкой.
+
+    `android/arm64-v8a` → `android`; `desktop/windows_amd64` → `desktop/windows` → `desktop`.
+    Многоцелевые обе платформы: Android — по ABI, Desktop — по ОС и арке, поэтому уровень
+    уточнения есть у каждой, и ни одна не обязана описывать себя через общий ключ.
+
+    ⛔ Побеждает ПЕРВАЯ объявленная секция, слияния уровней нет. Секция перечисляет файлы цели
+    ЦЕЛИКОМ, и слияние довозило бы под узкую цель файл, объявленный для широкой, — то есть
+    библиотеку не той архитектуры, которую `dlopen` на устройстве отвергнет."""
+    if kind == "android":
+        return [f"android/{fmt['abi']}", "android"]
+    return [f"desktop/{fmt['os']}_{fmt['arch']}", f"desktop/{fmt['os']}", "desktop"]
+
+
+@functools.lru_cache(maxsize=None)
+def _nativelib_section_prefixes():
+    """(точные ключи, префиксы `desktop/<os>_`) — всё, что сборщик признаёт ключом секции."""
+    exact = {"android", "desktop"}
+    exact |= {f"android/{abi}" for abi in android_abi_list()}
+    exact |= {f"desktop/{o}" for o in DESKTOP_OSES}
+    return exact, tuple(f"desktop/{o}_" for o in DESKTOP_OSES)
+
+
+def validate_native_libs(mod):
+    """Отказ на ключе, которого сборщик не знает, — ДО первой сборки.
+
+    ⛔ Без этой проверки опечатка (`andriod`, `windows` вместо `desktop/windows`, ABI с точкой
+    вместо дефиса) не даёт ни строки вывода: секция просто не находится, цель собирается без
+    движка и уезжает в релиз. Молчание тут дороже отказа — неполный бандл ставится без жалоб и
+    падает уже на устройстве."""
+    nl = MODULES[mod]["nativelibs"] or {}
+    if not nl:
+        return True
+    exact, prefixes = _nativelib_section_prefixes()
+    bad = [k for k in nl
+           if k != NATIVELIB_HINT_KEY and k not in exact and not k.startswith(prefixes)]
+    if bad:
+        err(f"[{mod}] nativeLibs: неизвестные ключи секций: {', '.join(sorted(bad))}")
+        info(f"допустимые: {NATIVELIB_HINT_KEY}, " + ", ".join(sorted(exact)) +
+             ", " + ", ".join(f"{p}<arch>" for p in prefixes))
+        return False
+    return True
+
+
+def native_libs_for(mod, kind, **fmt):
+    """Объявленные доп. библиотеки для цели: {имя файла: путь-источник}, плейсхолдеры подставлены.
+
+    `kind` — `android` (нужен `abi=`) либо `desktop` (нужны `os=`/`arch=`); какие секции этой цели
+    подходят и в каком порядке — `native_libs_sections`.
+
+    ⚠ Форматируются И ПУТЬ, И ИМЯ: `libengine{dlext}` обязано дать `libengine.dll` на Windows, а
+    `{abi}`/`{arch}` в имени — развести файлы, если автор их так назвал. Подстановки:
+    `{abi}` (android), `{os}`/`{arch}` (desktop), `{dlext}` — везде."""
+    if not validate_native_libs(mod):
+        return None
+    if kind != "android" and fmt.get("os") not in DESKTOP_OSES:
+        err(f"[{mod}] доп. библиотеки: неизвестная desktop-ОС '{fmt.get('os')}'")
+        return None
+    nl = MODULES[mod]["nativelibs"] or {}
+    keys = native_libs_sections(kind, **fmt)
+    key = next((k for k in keys if k in nl), None)
+    if key is None:
+        return {}
+    fmt = dict(fmt, dlext=DL_EXT["android" if kind == "android" else fmt["os"]])
+    out = {}
+    for name, src in (nl[key] or {}).items():
+        try:
+            out[str(name).format(**fmt)] = str(src).format(**fmt)
+        except KeyError as e:
+            err(f"[{mod}] nativeLibs['{key}']['{name}']: неизвестный плейсхолдер {e}")
+            return None
+    return out
+
+
+def native_libs_resolved(mod, kind, **fmt):
+    """[(имя у цели, объявленный путь, абсолютный путь, лежит ли)] — ОБЩЕЕ ЯДРО проверки и выкладки.
+
+    `--doctor` докладывает по этому списку, `stage_native_libs` по нему копирует: диагностика
+    смотрит ровно туда же, куда полезет сборка, и разойтись им негде. `None` — дескриптор
+    отвергнут (неизвестный ключ секции либо плейсхолдер)."""
+    libs = native_libs_for(mod, kind, **fmt)
+    if libs is None:
+        return None
+    root = REPO / MODULES[mod]["root"]
+    out = []
+    for name, rel in libs.items():
+        src = (root / rel).resolve()
+        out.append((name, rel, src, src.is_file()))
+    return out
+
+
+def stage_native_libs(mod, kind, out_dir, **fmt):
+    """Кладёт объявленные доп. библиотеки рядом с helper'ом в `dist/<цель>/`.
+
+    ⛔ ЗАЧЕМ ОТКАЗ, А НЕ ПРЕДУПРЕЖДЕНИЕ. Каталог цели уезжает в бандл КАК ЕСТЬ (`_zip_flat`), и
+    неполный каталог даёт модуль, который ставится без единой жалобы, а падает уже на устройстве:
+    helper стартует, зовёт `dlopen` и не находит движок. Живой случай (csqtt 1.2.36): сборка
+    отрапортовала успехом, на телефоне — `libcsqtt_engine.so not found next to helper`, и понять
+    это можно было только по логу модуля. Поэтому отсутствие объявленного файла — отказ сборки.
+
+    Сборщик сам эти библиотеки НЕ собирает: у них чужой тулчейн (у csqtt — cargo с
+    android-таргетами), а исполнять команду из чужого дескриптора значит запускать чужой код на
+    машине сборщика. Автор собирает их своим скриптом и объявляет, ГДЕ лежит результат; текст
+    `nativeLibs.hint` печатается здесь же, чтобы не искать эту команду по репозиторию."""
+    libs = native_libs_resolved(mod, kind, **fmt)
+    if libs is None:
+        return False
+    target = native_libs_sections(kind, **fmt)[0]
+    hint = (MODULES[mod]["nativelibs"] or {}).get(NATIVELIB_HINT_KEY, "")
+    for name, rel, src, exists in libs:
+        if not exists:
+            err(f"[{mod}/{target}] нет объявленной библиотеки {name}: {rel}")
+            if hint:
+                info(f"собрать её: {hint}")
+            return False
+        shutil.copy2(src, out_dir / name)
+        info(f"  nativeLib: {name} ← {rel}")
+    return True
 
 
 def build_android(mod, abis, api):
@@ -642,6 +836,13 @@ def build_android(mod, abis, api):
     if rc != 0:
         return False
     dist_root = REPO / m["root"] / "dist" / "android"
+    # ⛔ Доп. библиотеки выкладываются ТОЛЬКО под ABI ЭТОЙ команды. Цикл ниже обходит все каталоги
+    # с helper'ом, потому что дескриптор зависит от module.json и обязан обновиться везде; а вот
+    # `stage_native_libs` — про цели, которые сейчас собирают. Иначе `--abis arm64-v8a` падал бы
+    # из-за каталога другого ABI, собранного когда-то раньше: запрошенная цель готова целиком, а
+    # команда рапортует отказ. Полноту всего `dist/` держит `--bundle` — там это инвариант
+    # релиза, и там же ему место.
+    requested = android_abi_list() if abis == "all" else [a.strip() for a in abis.split(",") if a.strip()]
     for abi_dir in sorted(dist_root.iterdir()) if dist_root.is_dir() else []:
         if not abi_dir.is_dir() or not (abi_dir / m["helper"]).is_file():
             continue
@@ -651,6 +852,8 @@ def build_android(mod, abis, api):
         for stale in abi_dir.glob("*.h"):
             stale.unlink()
         emit_android_descriptor(mod, abi_dir.name, abi_dir)
+        if abi_dir.name in requested and not stage_native_libs(mod, "android", abi_dir, abi=abi_dir.name):
+            return False
     return True
 
 
@@ -683,7 +886,7 @@ README_ARCHIVE_TEMPLATE = """# Модуль «__NAME__» для AntiNet (`__SCHE
 | `README.md` | этот файл — точка входа |
 __DOCS_ROWS__| `build.py` | сборщик helper-бинарей под все ОС. `python build.py --help`, `--doctor` |
 | `tools/build-module.py` | низкоуровневый Android-билдер (NDK clang → `.so`), зовётся из `build.py` |
-| `examples/__MODNAME__/` | **сам модуль-образец**: `module.json` (единый дескриптор) + `native/` (Go data-plane) |
+| `examples/__MODNAME__/` | **сам модуль-образец**: `module.json` (единый дескриптор) + `native/` (Go data-plane). Ссылки доков на ДРУГИЕ `examples/*` ведут в репозиторий AntiNet — здесь лежит только этот модуль, а доки одинаковы во всех архивах и о раскладке конкретного не знают |
 | `shared/` | **каноны** — общий код всех модулей. `build.py` копирует их в main-пакет helper'а перед сборкой и убирает после; в дереве модуля их нет и класть туда не надо |
 | `antinet-module.example.json` | образец манифеста авто-обновления (реальный генерит `--bundle`) |
 | `LICENSE` | лицензия сборочной системы и канонов — **MIT**. Лицензия самого модуля — `__LICENSE_ID__`, см. ниже |
@@ -846,11 +1049,7 @@ def _module_tracked_files(modroot):
 def _rmtree_force(path):
     """rmtree, переживающий read-only файлы. На Windows объекты git-хранилища создаются
     read-only, и голый `shutil.rmtree` падает на них `PermissionError` — из-за этого `--package`
-    для masterdns не собирался вовсе (в его дереве лежит вендорнутая git-база).
-
-    `onexc` у `shutil.rmtree` появился только в Python 3.12, а машина сборки может быть и на 3.11,
-    где тот же приём называется `onerror` и принимает функцию с той же сигнатурой. Поэтому ветка
-    выбирается по возможности, а не по версии интерпретатора."""
+    для masterdns не собирался вовсе (в его дереве лежит вендорнутая git-база)."""
     def _chmod_retry(func, p, exc=None):
         os.chmod(p, stat.S_IWRITE)
         func(p)
@@ -909,28 +1108,68 @@ def _license_section(mod, d):
             f"а не этот модуль, если не хотите наследовать {lic}." + tail)
 
 
-def _docs_rows(mod):
-    """Строки таблицы «что внутри» для доков системы. Их несёт только эталонный архив, поэтому
-    и строки о них появляются только там — таблица обязана описывать РЕАЛЬНОЕ содержимое, иначе
-    первое же действие читателя (открыть MODULE_API.md) упирается в отсутствующий файл."""
-    # UPGRADE.md есть в КАЖДОМ архиве: он про работу автора со СВОИМ апстримом, а не про
-    # AntiNet-сторону, поэтому его строка стоит до развилки.
-    upgrade = ("| `UPGRADE.md` | **бамп апстрима одной командой** — как влить новую версию своего "
-               "апстрима трёхсторонним слиянием, не потеряв интеграционный слой |\n")
-    if mod != DOCS_REFERENCE_MODULE:
-        # Текст README ниже ссылается на эти доки по именам. Одна честная строка разрешает ВСЕ
-        # такие ссылки разом — лучше, чем помечать каждое упоминание по отдельности.
-        return upgrade + (
-            "| _(остальных доков системы здесь нет)_ | `MODULE_API.md` / `MODULE_SYSTEM.md` / "
-            "`PORTING.md` в этот архив не входят: он — авторская поставка модуля, а не SDK. "
-            f"Ссылки на них ниже ведут в эталонный архив `{DOCS_REFERENCE_MODULE}-module` и в "
-            "репозиторий AntiNet |\n")
-    return upgrade + (
+def _docs_rows():
+    """Строки таблицы «что внутри» для доков системы.
+
+    ⛔ Комплект ОДИН на все архивы, развилки «эталонный / остальные» здесь нет и быть не должно.
+    Она была, и цена известна: архив автора ехал без `MODULE_API.md` со строкой «смотрите в
+    эталонном архиве», автор держал СВОЮ копию контракта, та отставала — и 19.09 модуль `csqtt`
+    разбирал ответ действия наугад (искал `access_token=` там, где хост отдаёт конверт
+    `{"type":"webview","value":…}`), потому что подраздела про конверт в его копии не было.
+    Контракт, по которому автор ОБЯЗАН писать, не может быть «не про его модуль»."""
+    return (
+        "| `UPGRADE.md` | **бамп апстрима одной командой** — как влить новую версию своего "
+        "апстрима трёхсторонним слиянием, не потеряв интеграционный слой |\n"
         "| `MODULE_SYSTEM.md` | **обзор модульной системы**: из чего состоит модуль, тулчейн "
         "(какие компиляторы/NDK, кросс-компиляция), быстрый старт, публикация |\n"
         "| `MODULE_API.md` | **контракт** — что helper обязан предоставить, семантика каждого "
         "ключа `module.json`, все опции |\n"
         "| `PORTING.md` | внутренности AntiNet-стороны (кому портировать/чинить хост) |\n")
+
+
+def gen_archive_gitignore(mod):
+    """`.gitignore` для репозитория автора — СОБИРАЕТСЯ ИЗ ЖИВЫХ ДАННЫХ, не пишется руками.
+
+    Автор кладёт распакованный архив под свой git (так сделали все трое внешних авторов), и без
+    этого файла в индекс уезжает ровно то, что у нас самих игнорируется: собранные бинари, ZIP'ы
+    релиза, локальные бамп-гиты с путями ЭТОЙ машины и — у модуля с доп. библиотекой (§2.4) — весь
+    `target/` чужого тулчейна, то есть гигабайты объектников cargo.
+
+    Имена канонов берутся из той же таблицы `CANONS`, по которой идёт инжект, и перечисляются
+    ПОИМЁННО, а не маской: маска `dns_*.go` накрыла бы одноимённый файл самого модуля, а инжект
+    работает по точным именам. Новый канон попадает сюда сам — расходиться списку не с чем."""
+    m = MODULES[mod]
+    modname = Path(m["root"]).name
+    # Путь main-пакета внутри каталога модуля — туда build.py кладёт каноны перед сборкой.
+    pkg_rel = Path(m["dir"]).relative_to(m["root"]).as_posix()
+    if m["pkg"] not in (".", ""):
+        pkg_rel = f'{pkg_rel}/{m["pkg"].lstrip("./")}'
+    # Объединение ОБЕИХ сборок: `offtun` инжектится только в desktop, и .gitignore обязан знать
+    # оба набора — иначе после desktop-сборки автор увидит канон как «свой новый файл».
+    canon_names = []
+    for cdef in CANONS:
+        if cdef["gate"] and not m["descriptor"].get(cdef["gate"]):
+            continue
+        canon_names += [f"examples/{modname}/{pkg_rel}/{p.name}"
+                        for p in sorted(cdef["dir"].glob(cdef["glob"]))]
+    return (
+        "# Выдача build.py — пересоздаётся, исходником не является.\n"
+        "examples/*/dist/\n"
+        "examples/*/dist-release/\n"
+        "/dist-archive/\n"
+        "\n"
+        "# Выдача чужого тулчейна у доп. библиотек (MODULE_API.md §2.4): cargo, cmake и подобные.\n"
+        "target/\n"
+        "\n"
+        "# Бамп-гиты апстрима (UPGRADE.md) — служебные и привязаны к путям конкретной машины.\n"
+        "/.bumpgits/\n"
+        "\n"
+        "__pycache__/\n"
+        "*.pyc\n"
+        "\n"
+        "# Каноны shared/*: build.py копирует их в main-пакет перед сборкой и удаляет после.\n"
+        "# Своей копии у модуля быть не должно — список ведёт build.py (таблица CANONS).\n"
+        + "".join(f"{n}\n" for n in canon_names))
 
 
 def gen_archive_readme(mod):
@@ -945,7 +1184,7 @@ def gen_archive_readme(mod):
             # цифра рядом с go.mod гарантированно с ней разъезжается — здесь и стояло «1.23+»
             # при `go 1.25.0` у echo и `go 1.26` у qwdtt.
             .replace("__GOMIN__", "%d.%d" % go_required_for(mod))
-            .replace("__DOCS_ROWS__", _docs_rows(mod))
+            .replace("__DOCS_ROWS__", _docs_rows())
             .replace("__LICENSE_SECTION__", _license_section(mod, d))
             .replace("__LICENSE_ID__", d.get("license", "MIT"))
             .replace("__HOMEPAGE__", d.get("homepage", "") or "(не указана)"))
@@ -985,6 +1224,10 @@ def cmd_package(mod):
         # апстрим-референсы и `.old-`/`bump-wip`-деревья, — поэтому это запасной путь, а не основной.
         ign = shutil.ignore_patterns(
             "dist", "dist-release", "build", ".gradle", "__pycache__", ".git*", "*.pyc",
+            # `target` — выдача cargo у модуля с доп. библиотекой (§2.4). В основном пути он
+            # отсекается сам (gitignored, а состав берётся по git); здесь его надо назвать, иначе
+            # запасной путь уносит в архив автора гигабайты промежуточных объектников.
+            "target",
             "*.zip", "*.exe", "*.so", "*.dll", "*.dylib", "*.aar")
         shutil.copytree(root, dst_mod, ignore=ign)
         info("  состав модуля: по шаблонам (git недоступен)")
@@ -992,46 +1235,50 @@ def cmd_package(mod):
     # ⚠ Пути внутри доков репо-относительные (`module_system/build.py`), а в архиве префикса
     # `module_system/` нет. Чиним ЗДЕСЬ, а не «автор догадается»: доку, команды из которой не
     # работают копипастом, автор перестаёт читать после первой же неудачи. Правило одно на все
-    # доки архива — отсюда общая функция, а не похожие замены по местам.
-    # Второе, что чинит та же функция: доки ссылаются на ВСЕ референс-модули репозитория, а архив
-    # несёт РОВНО ОДИН. Ссылка на чужой модуль у автора не разрешается — помечаем её как внешнюю,
-    # вместо того чтобы вырезать (сам референс полезен, он просто лежит не здесь). Список берём из
-    # реестра, а не хардкодом: `--package` любого модуля обязан пометить все ОСТАЛЬНЫЕ, поэтому
-    # добавление четвёртого модуля не требует правки этой функции.
-    foreign = [Path(o["root"]).name for k, o in MODULES.items() if k != mod]
-
+    # доки архива — отсюда общая функция, а не похожие замены по местам. Замена от модуля НЕ
+    # зависит, и это инвариант, а не совпадение (см. ниже).
+    #
+    # ⛔ ПОМЕТКИ ЧУЖИХ ПРИМЕРОВ ЗДЕСЬ НЕТ И БЫТЬ НЕ ДОЛЖНО. Раньше ссылки на референс-модули,
+    # которых нет в ЭТОМ архиве, переписывались в «(репозиторий AntiNet) examples/<чужой>/» —
+    # и от этого КОНТРАКТ становился разным у разных модулей: echo-архив и qwdtt-архив несли
+    # `MODULE_API.md`, расходящиеся на 14 строк. API — одна спецификация на всю систему, она не
+    # может зависеть от того, рядом с каким модулем лежит её копия; расходящиеся копии и есть тот
+    # механизм, которым автор получает не тот контракт, по которому написан хост. Оговорка о том,
+    # где лежат примеры, живёт ОДИН раз — в README архива, и одинакова у всех.
     def _repo_paths_to_archive(text):
-        text = (text.replace("module_system/build.py", "build.py")
+        return (text.replace("module_system/build.py", "build.py")
                     .replace("module_system/examples/", "examples/")
                     .replace("module_system/shared/", "shared/")
                     .replace("module_system/dist-archive/", "dist-archive/")
                     .replace("`module_system/`", "корня архива"))
-        for fm in foreign:
-            text = text.replace(f"`examples/{fm}/", f"`(репозиторий AntiNet) examples/{fm}/")
-        return text
 
     # LICENSE — ОБЯЗАТЕЛЕН в архиве, а не «желателен»: без него опубликованные исходники по
     # умолчанию под полным авторским правом, т.е. автор формально не вправе ни собрать образец,
     # ни сделать на его основе свой модуль — ровно то, ради чего архив и существует.
     shutil.copy2(HERE / "LICENSE", stage / "LICENSE")
-    # Доки МОДУЛЬНОЙ СИСТЕМЫ (контракт, внутренности хоста, обзор) едут ТОЛЬКО с эталонным
-    # архивом. Остальные два — авторская поставка: исходники модуля + каноны + сборка, то есть
-    # ровно то, что публикует автор своего модуля. Класть ему в архив наш контракт и внутренности
-    # AntiNet-стороны незачем: они не про его модуль, устаревают отдельно от него, и читатель его
-    # релиза пришёл за модулем, а не за SDK. Кто пишет СВОЙ модуль — берёт эталонный архив.
-    if mod == DOCS_REFERENCE_MODULE:
-        for doc in ("MODULE_API.md", "PORTING.md"):
-            shutil.copy2(HERE / doc, stage / doc)
-        # module_system/README.md — обзор системы + ТУЛЧЕЙН + карта папок. Едет под именем
-        # MODULE_SYSTEM.md, потому что корневой README.md в архиве занят точкой входа автора.
-        (stage / "MODULE_SYSTEM.md").write_text(
+    # ⛔ Доки МОДУЛЬНОЙ СИСТЕМЫ едут в КАЖДЫЙ архив, без развилки по модулю. Контракт — это то,
+    # по чему автор ОБЯЗАН писать: отдавать ему исходники и каноны, а контракт оставлять «в
+    # эталонном архиве» — значит заставить его завести СВОЮ копию, которая отстанет. Именно так и
+    # вышло: 19.09 модуль `csqtt` разбирал ответ действия наугад (искал подстроку `access_token=`
+    # там, где хост отдаёт конверт `{"type":"webview","value":…}`) — у автора была копия контракта
+    # без подраздела про конверт, и вход в VK не проходил вовсе. Доки едут ВМЕСТЕ с канонами,
+    # одной выкладкой, поэтому разойтись им больше не с чем.
+    for doc in ("MODULE_API.md", "PORTING.md"):
+        shutil.copy2(HERE / doc, stage / doc)
+    # Обзор системы + ТУЛЧЕЙН + карта папок. Едет под именем MODULE_SYSTEM.md, потому что корневой
+    # README.md в архиве занят точкой входа автора. Источник — SYSTEM_DOC_FILE (см. его объявление):
+    # из репозитория это `module_system/README.md`, из распакованного архива — уже готовый
+    # `MODULE_SYSTEM.md`, и шапку ему второй раз не приписываем.
+    system_doc = SYSTEM_DOC_FILE.read_text(encoding="utf-8")
+    if SYSTEM_DOC_FILE.name == "README.md":
+        system_doc = (
             "<!-- Копия module_system/README.md из репозитория AntiNet. Пути приведены к раскладке\n"
-            "     этого архива: префикс `module_system/` в нём отсутствует. -->\n\n"
-            + (HERE / "README.md").read_text(encoding="utf-8"), encoding="utf-8")
+            "     этого архива: префикс `module_system/` в нём отсутствует. -->\n\n" + system_doc)
+    (stage / "MODULE_SYSTEM.md").write_text(system_doc, encoding="utf-8")
 
-    # UPGRADE.md — в КАЖДЫЙ архив, в отличие от контракта выше. Он не про AntiNet-сторону, а про
-    # РАБОТУ АВТОРА: как влить новую версию СВОЕГО апстрима, не потеряв интеграционный слой.
-    # Автору qWDTT/masterdns он нужнее, чем автору эталона: у них апстрим живой и бампается.
+    # UPGRADE.md — он не про AntiNet-сторону, а про РАБОТУ АВТОРА: как влить новую версию СВОЕГО
+    # апстрима, не потеряв интеграционный слой. Автору qWDTT/masterdns он нужнее, чем автору
+    # эталона: у них апстрим живой и бампается.
     shutil.copy2(HERE / "UPGRADE.md", stage / "UPGRADE.md")
 
     # ⛔ ОДИН проход по ВСЕМ .md стейджа — ровно потому, что правило заявлено единым. Пока правка
@@ -1059,10 +1306,15 @@ def cmd_package(mod):
     # манифеста), и они уезжали бы с CRLF — та же дыра «мимо общего правила», только по позиции,
     # а не по перечню.
     TEXT_SUFFIXES = (".md", ".go", ".py", ".json", ".mod", ".sum")
+    # Текстовые файлы БЕЗ расширения — иначе мимо нормализации, и один и тот же документ уезжает
+    # к авторам разными байтами: LICENSE ехал CRLF из репозитория автора и LF из нашего, хотя текст
+    # в нём один. Для общей поставки «тот же файл, другие байты» — такое же расхождение, как
+    # разный текст: сверка архивов по хешам его и поймала.
+    TEXT_NAMES = ("LICENSE",)
 
     def _normalize_stage_text():
         for f in sorted(stage.rglob("*")):
-            if not f.is_file() or f.suffix not in TEXT_SUFFIXES:
+            if not f.is_file() or (f.suffix not in TEXT_SUFFIXES and f.name not in TEXT_NAMES):
                 continue
             text = f.read_text(encoding="utf-8")
             if f.suffix in (".md", ".go"):
@@ -1090,6 +1342,7 @@ def cmd_package(mod):
     (stage / "antinet-module.example.json").write_text(
         json.dumps(example_manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     (stage / "README.md").write_text(gen_archive_readme(mod), encoding="utf-8")
+    (stage / ".gitignore").write_text(gen_archive_gitignore(mod), encoding="utf-8")
     _normalize_stage_text()          # последним: стейдж полностью собран, мимо прохода не уедет ничего
     zpath = arch / f"{mod}-module-v{vname}.zip"
     if zpath.exists():
@@ -1165,6 +1418,23 @@ def cmd_bundle(mod):
     for bdir, key in to_zip:
         if bad := _bundle_target_mismatch(bdir, key):
             err(f"[{mod}] {bad} — релиз не собран, dist-release не тронут"); return False
+        # Объявленная доп. библиотека обязана лежать в каталоге цели. Её отсутствие даёт бандл,
+        # который ставится молча и падает у пользователя на `dlopen` — проверяем ДО записи первого
+        # архива, тем же правилом, что и подпись арки.
+        # Имена считаются ПОД ЭТУ ЦЕЛЬ (`native_libs_for`), а не читаются из дескриптора сырыми:
+        # у `libengine{dlext}` имя файла разное на каждой ОС, и сравнение с несформатированным
+        # ключом не нашло бы ни одного файла — отказ был бы ложным на всех целях сразу.
+        if bdir.parent.name == "android":
+            declared = native_libs_for(mod, "android", abi=key)
+        else:
+            goos, _, goarch = key.partition("_")
+            declared = native_libs_for(mod, "desktop", os=goos, arch=goarch)
+        if declared is None:
+            err(f"[{mod}] дескриптор отвергнут — dist-release не тронут"); return False
+        if missing_libs := [n for n in declared if not (bdir / n).is_file()]:
+            err(f"[{mod}] в {bdir.name} нет объявленных библиотек: {', '.join(missing_libs)} — "
+                f"бандл был бы неполным, dist-release не тронут")
+            return False
 
     android_bundles = {}
     if android_root.exists():
@@ -1278,7 +1548,9 @@ def _bump_bootstrap(mod, m, up, work, gitdir):
     Внутри дерева не появляется ничего.
 
     Идемпотентна: прерванный прогон до-выполняется без повторного fetch'а."""
-    if not (work / "go.mod").exists() and not any(work.glob("*.go")):
+    # Проверяем, что дерево есть и непустое, а НЕ что оно на Go: вендоренный апстрим бывает и не
+    # Go-шным (у csqtt это rust-движок), а слияние языка не знает вовсе.
+    if not work.is_dir() or not any(p.is_file() for p in work.rglob("*")):
         err(f"[{mod}] нет дерева модуля: {work}"); return False
 
     BUMPGITS.mkdir(exist_ok=True)
@@ -1376,9 +1648,7 @@ def _bump_subset_tree(mod, gitdir, rev, work):
                     ours.add(rel)
         drop = sorted(upstream_files - ours)
         if drop:
-            # -z/NUL-separated: text-mode stdin on Windows rewrites \n to \r\n, which would leave
-            # every path with a trailing \r that matches nothing and silently "ignores" it.
-            r = gi("update-index", "--force-remove", "-z", "--stdin", stdin="\0".join(drop) + "\0")
+            r = gi("update-index", "--force-remove", "--stdin", stdin="\n".join(drop) + "\n")
             if r.returncode != 0:
                 err(f"[{mod}] update-index --force-remove: {r.stderr.strip()[:200]}"); return None
         kept = len(upstream_files) - len(drop)
@@ -1451,9 +1721,21 @@ def cmd_bump(mod, ref):
         info('пример: "upstream": {"url": "https://github.com/...", "base": "v1.4.3", "prefix": "go_client"}')
         return False
 
-    work = (REPO / m["dir"]).resolve()
+    # Какое ДЕРЕВО бампаем. По умолчанию — Go-дерево модуля (`build.goDir`): у большинства модулей
+    # вендорен именно апстримный Go-клиент, и второго дерева нет.
+    #
+    # ⛔ `upstream.dir` — для модулей, у которых апстрим живёт НЕ в goDir. У csqtt вендорен rust-движок
+    # (`native/csqtt-engine` ← апстримный `rust-client/`), а `native/csqtt` — целиком наша обвязка,
+    # которой в апстриме нет вовсе: бамп по goDir там синтезировал бы сторону слияния из каталога,
+    # не имеющего к апстриму отношения, и любое слияние было бы бессмысленным.
+    work_rel = m["dir"]
+    if up.get("dir"):
+        work_rel = f'{m["root"]}/{up["dir"].strip().strip("/")}'
+    work = (REPO / work_rel).resolve()
+    if not work.is_dir():
+        err(f"[{mod}] дерева для бампа нет: {work_rel}"); return False
     gitdir = BUMPGITS / f"{mod}.git"
-    info(f"[{mod}] {up['base']} → {ref}")
+    info(f"[{mod}] {up['base']} → {ref}  (дерево: {work_rel})")
 
     if not _bump_bootstrap(mod, m, up, work, gitdir):
         return False
@@ -1571,7 +1853,7 @@ def main():
     # doctor — самостоятельная команда: ничего не собирает, только смотрит на хост.
     if a.doctor:
         targets = list(ALL_OSES) if a.os in (None, "all") else [a.os]
-        return 0 if cmd_doctor(targets, a.module) else 1
+        return 0 if cmd_doctor(targets, a.module, a.arch) else 1
 
     # bump / test / package / bundle — самостоятельные команды над ОДНИМ модулем: резолвим его и
     # выходим. package/bundle обходятся копированием и zip'ом, test нужен Go, bump — git.
