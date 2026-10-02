@@ -45,7 +45,7 @@ Android-приложение форка, кнопка «Поделиться п�
 
 | Файл / каталог | Зона |
 |---|---|
-| **`module.json`** | дескриптор: схема `openflux`, `socks5`+`dnsResolver` (каноны), `handoverMode: signal` + `hostEvents: [handover, netlost, netback, stall]` (§2.8 — модуль разбирает все четыре причины), `pingTimeoutSec: 60`, четыре настройки (`dialTimeoutSec`/`keepAliveSec`/`captchaMode`/`debugLog`) |
+| **`module.json`** | дескриптор: схема `openflux`, `socks5`+`dnsResolver` (каноны), `handoverMode: signal` + `hostEvents: [handover, netlost, netback, stall]` (§2.8 — модуль разбирает все четыре причины), `pingTimeoutSec: 60`, пять настроек (`dialTimeoutSec`/`keepAliveSec`/`captchaMode`/`manualCookies`/`debugLog`) |
 | **`native/openflux/cmd/helper/main.go`** | **единственный файл, который принадлежит модулю**: грамматика ссылки, `realMain`, `moduleCall`, SOCKS5-транспорт поверх туннеля, protected-резолвер dial-таргетов |
 | `native/openflux/transport/`, `network/`, `utils/`, `tunnel/endpoint.go` | **дословные копии [openflux-server](https://github.com/wlruscfd/openflux-server)** — побайтово, включая авторские комментарии. Бамп = перезапись файлов, сверка `diff --strip-trailing-cr` |
 | `native/openflux/transport/*/handover.go` | НАШИ файлы рядом с вендорными: `Handover()` каждого транспорта (событие хоста §2.8). Отдельным файлом именно чтобы вендорные оставались перезаписываемыми |

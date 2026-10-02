@@ -227,3 +227,23 @@ func TestSummarizeSessionAndAccount(t *testing.T) {
 		}
 	}
 }
+
+type recordingCookieProvider struct{ got string }
+
+func (r *recordingCookieProvider) ProvideCookies(c string) { r.got = c }
+
+func TestApplyManualCookies(t *testing.T) {
+	p := &recordingCookieProvider{}
+	if n := applyManualCookies("Cookie: spravka=1; yandexuid=2; ;broken", p); n != 2 || p.got != "spravka=1; yandexuid=2; ;broken" {
+		t.Fatalf("n=%d got=%q", n, p.got)
+	}
+	for _, empty := range []string{"", "   ", "nonsense without pairs", "Cookie:"} {
+		q := &recordingCookieProvider{}
+		if n := applyManualCookies(empty, q); n != 0 || q.got != "" {
+			t.Fatalf("%q must not be handed to the transport: n=%d got=%q", empty, n, q.got)
+		}
+	}
+	if applyManualCookies("a=1", nil) != 0 {
+		t.Fatal("a transport that takes no cookies must be skipped")
+	}
+}

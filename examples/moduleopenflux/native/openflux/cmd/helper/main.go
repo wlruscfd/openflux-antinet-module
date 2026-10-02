@@ -111,6 +111,7 @@ type ofStrings struct {
 	captchaWindowTitle      string
 	captchaWindowText       string
 	captchaNoHostSupportFmt string // %s — что объявил хост
+	manualCookiesFmt        string // %d — сколько cookie из настройки
 	captchaOpenedFmt        string // %s — что объявил хост
 	captchaAnsweredFmt      string // %d cookie, %s откуда
 	captchaClosedLog        string
@@ -137,6 +138,7 @@ var ofStringsRU = ofStrings{
 	captchaWindowTitle:      "Проверка Яндекса",
 	captchaWindowText:       "Пройдите проверку в этом окне — оно закроется само, когда проверка будет пройдена.",
 	captchaNoHostSupportFmt: "OpenFlux: хост не объявил ни webview.cookies, ни webview.bridge (объявлено: %s) — окно проверки не сможет вернуть cookie, обновите AntiNet",
+	manualCookiesFmt:        "OpenFlux: подаю транспорту cookie из настройки (%d шт.)",
 	captchaOpenedFmt:        "OpenFlux: открываю окно проверки (хост объявил: %s)",
 	captchaAnsweredFmt:      "OpenFlux: окно проверки ответило: cookie %d (%s)",
 	captchaClosedLog:        "OpenFlux: окно проверки закрыто без результата",
@@ -163,6 +165,7 @@ var ofStringsEN = ofStrings{
 	captchaWindowTitle:      "Yandex check",
 	captchaWindowText:       "Pass the check in this window - it closes by itself once the check is passed.",
 	captchaNoHostSupportFmt: "OpenFlux: the host declares neither webview.cookies nor webview.bridge (declared: %s) - the check window cannot return cookies, update AntiNet",
+	manualCookiesFmt:        "OpenFlux: handing the transport the cookies from the setting (%d)",
 	captchaOpenedFmt:        "OpenFlux: opening the check window (host declared: %s)",
 	captchaAnsweredFmt:      "OpenFlux: the check window answered: %d cookies (%s)",
 	captchaClosedLog:        "OpenFlux: the check window was closed without a result",
@@ -564,6 +567,9 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		emitStatus(statusFatal, "transport start failed")
 		log.Fatalf("transport start: %v", err)
 	}
+	if n := applyManualCookies(cfg["SETTING_manualCookies"], built.cookies); n > 0 {
+		emitLog(s.manualCookiesFmt, n)
+	}
 
 	// Хендовер: дескриптор объявляет `handoverMode: "signal"` + `hostEvents` (все четыре причины,
 	// §2.8) — хост НЕ убивает helper на смене сети, а шлёт событие в живой процесс. Реакция —
@@ -749,6 +755,26 @@ func buildTransport(link openFluxLink, tcfg transport.TransportConfig, mode capt
 		return builtTransport{trans: wrapGeneric(ot), handover: ot}, nil
 	}
 	return builtTransport{}, fmt.Errorf("unsupported transport %q", link.Transport)
+}
+
+// applyManualCookies подаёт транспорту cookie из настройки `manualCookies`: путь, не зависящий от
+// того, умеет ли хост отдавать cookie из окна проверки. Возвращает число принятых пар.
+func applyManualCookies(raw string, provider transport.CookieProvider) int {
+	raw = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(raw), "Cookie:"))
+	if raw == "" || provider == nil {
+		return 0
+	}
+	pairs := 0
+	for _, part := range strings.Split(raw, ";") {
+		if name, _, ok := strings.Cut(strings.TrimSpace(part), "="); ok && name != "" {
+			pairs++
+		}
+	}
+	if pairs == 0 {
+		return 0
+	}
+	provider.ProvideCookies(raw)
+	return pairs
 }
 
 // settingDuration — значение настройки в секундах (MODULE_API §2.11). Непарсящееся/нулевое →
