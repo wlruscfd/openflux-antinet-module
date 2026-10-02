@@ -103,6 +103,15 @@ type ofStrings struct {
 	netBackLog              string
 	stallLog                string
 	dnsUpdatedFmt           string // %d — сколько резолверов прислал хост
+	attemptFailedFmt        string // %s попытка, %s причина, %s текст, %s пауза (сек)
+	attemptFailedPlainFmt   string // %s — исходная строка события
+	transportUpFmt          string // %s — номер попытки
+	captchaWindowTitle      string
+	captchaWindowText       string
+	captchaNoHostSupportLog string
+	captchaClosedLog        string
+	captchaNoCookiesLog     string
+	captchaGotCookiesLog    string
 }
 
 var ofStringsRU = ofStrings{
@@ -118,6 +127,15 @@ var ofStringsRU = ofStrings{
 	netBackLog:              "сеть вернулась — переустанавливаю транспорт немедленно",
 	stallLog:                "хост не дождался ответа через туннель — передозваниваюсь (сеть не менялась)",
 	dnsUpdatedFmt:           "сеть сменилась — беру её DNS (%d шт.) вместо прежних",
+	attemptFailedFmt:        "OpenFlux: попытка %s не удалась, причина %s (%s), следующая через %sс",
+	attemptFailedPlainFmt:   "OpenFlux: попытка соединения не удалась: %s",
+	transportUpFmt:          "OpenFlux: транспорт поднят (попытка %s)",
+	captchaWindowTitle:      "Проверка Яндекса",
+	captchaWindowText:       "Пройдите проверку в этом окне — оно закроется само, когда проверка будет пройдена.",
+	captchaNoHostSupportLog: "OpenFlux: хост не объявил webview.cookies — окно проверки использовать нечем, переключите «Проверка Яндекса» в режим auto",
+	captchaClosedLog:        "OpenFlux: окно проверки закрыто без результата",
+	captchaNoCookiesLog:     "OpenFlux: окно проверки не вернуло cookie",
+	captchaGotCookiesLog:    "OpenFlux: cookie из окна проверки получены, переподключаю транспорт",
 }
 
 var ofStringsEN = ofStrings{
@@ -133,7 +151,18 @@ var ofStringsEN = ofStrings{
 	netBackLog:              "network is back - re-establishing the transport right away",
 	stallLog:                "the host saw no answer through the tunnel - re-dialing (network unchanged)",
 	dnsUpdatedFmt:           "network changed - switching to its DNS servers (%d)",
+	attemptFailedFmt:        "OpenFlux: attempt %s failed, reason %s (%s), next in %ss",
+	attemptFailedPlainFmt:   "OpenFlux: connection attempt failed: %s",
+	transportUpFmt:          "OpenFlux: transport is up (attempt %s)",
+	captchaWindowTitle:      "Yandex check",
+	captchaWindowText:       "Pass the check in this window - it closes by itself once the check is passed.",
+	captchaNoHostSupportLog: "OpenFlux: the host does not declare webview.cookies - the check window is useless, switch the Yandex check setting to auto",
+	captchaClosedLog:        "OpenFlux: the check window was closed without a result",
+	captchaNoCookiesLog:     "OpenFlux: the check window returned no cookies",
+	captchaGotCookiesLog:    "OpenFlux: cookies from the check window received, reconnecting the transport",
 }
+
+var ofText = ofStringsEN
 
 // ofStringsFor — APP_LANG "ru" → русский стол, всё остальное (в т.ч. пусто/неизвестно) → английский.
 // Правило выбора — канонное (`stringsForLang`, shared/hostproto): трактовка `APP_LANG`
@@ -420,7 +449,8 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
 	cfg := parseConfig(configContent)
-	s := ofStringsFor(cfg["APP_LANG"])          // §2.9: текст для юзера — на языке AntiNet
+	s := ofStringsFor(cfg["APP_LANG"])
+	ofText = s          // §2.9: текст для юзера — на языке AntiNet
 	port, _ := strconv.Atoi(cfg["LISTEN_PORT"]) // 0 = эфемерный (ядро выберет)
 	user := cfg["SOCKS_USER"]
 	pass := cfg["SOCKS_PASS"]
@@ -706,7 +736,11 @@ func settingDuration(cfg map[string]string, key string, defSec int) time.Duratio
 var netDown atomic.Bool
 
 func waitTransportUp(t transport.Transport) bool {
-	deadline := time.Now().Add(readyWaitBudget)
+	return waitTransportUpFor(t, readyWaitBudget)
+}
+
+func waitTransportUpFor(t transport.Transport, budget time.Duration) bool {
+	deadline := time.Now().Add(budget)
 	for time.Now().Before(deadline) {
 		if t.IsConnected() {
 			return true
@@ -726,7 +760,7 @@ func waitTransportUp(t transport.Transport) bool {
 		// модуль ждал молча, пока его не снимет хост по своему READY_TIMEOUT. Вторая половина
 		// той же перевёрнутости: при пропавшей сети бюджет, наоборот, истекал ровно по часам —
 		// то есть модуль сдавался именно тогда, когда рестарт заведомо ничего не чинит.
-		if netDown.Load() {
+		if netDown.Load() || captchaPending.Load() {
 			deadline = deadline.Add(transportUpPoll)
 		}
 	}
@@ -886,15 +920,14 @@ func solveCaptchaByWebView(profileDir, docURL string) (string, bool) {
 		// ⛔ Раньше здесь был молчаливый return, и это стоило диагностики: хост не умеет
 		// отдавать HttpOnly-куки, окно всё равно было бы бесполезным, но модуль об этом
 		// не говорил ни слова — выглядело как «ничего не происходит».
-		emitLog("OpenFlux: хост не объявил webview.cookies — окно капчи использовать нечем, " +
-			"переключите «Проверка Яндекса» в режим auto")
+		emitLog(ofText.captchaNoHostSupportLog)
 		return "", false
 	}
 	ids := fmt.Sprintf("of-captcha-%d", time.Now().UnixNano())
 	rule := map[string]any{
 		"type":           "webview",
-		"title":          "Проверка Яндекса",
-		"text":           "Пройдите проверку в этом окне — оно закроется само, когда проверка будет пройдена.",
+		"title":          ofText.captchaWindowTitle,
+		"text":           ofText.captchaWindowText,
 		"url":            docURL,
 		"userAgent":      yandex.BrowserUserAgent(),
 		"collectCookies": true,
@@ -933,83 +966,88 @@ func cookieHeader(jar map[string]string) string {
 	return strings.Join(parts, "; ")
 }
 
-// attachCaptchaSolver подписывает helper'а на событие проверки транспорта и кормит его cookie'ами
-// из окна хоста. `auto` сперва пробует PoW внутри транспорта, а к окну идёт только когда тот не
-// справился, — иначе каждое напоминание о проверке требовало бы лишнего клика человека.
+// attachCaptchaSolver подписывает helper'а на события транспорта: мост причин отказа в журнал хоста
+// и, если есть кому отдать cookie, окно проверки.
 //
-// provider передаётся ЯВНО, а не достаётся проверкой типа из `trans`: CompressedTransport встраивает
-// интерфейс Transport и не поднимает ProvideCookies, который в этом интерфейсе не значится. Проверка
-// типа на обёртке молча вернула бы false — и капча просто не решалась бы, без всякой ошибки.
-// autoCaptchaEscalateWindow — сколько ждать, прежде чем в `auto` звать человека.
-// Событие о проверке приходит ДО попытки внутреннего PoW, поэтому в `auto` первое событие
-// игнорируем: даём модулю решить проверку самому. Окно открываем, только если проверка
-// вернулась снова — то есть PoW не справился.
-const autoCaptchaEscalateWindow = 90 * time.Second
+// Когда открывать окно. `wv` — сразу на событие проверки. `auto` — только после того, как внутренний
+// PoW не справился, то есть на отказ с причиной captcha_*: событие проверки приходит ДО попытки PoW,
+// и раньше «второе событие в пределах 90 с» не наступало никогда — после неудачи Яндекс-транспорт
+// ждёт captchaCooldown (3 мин), а helper за это время выходит по readyWaitBudget (90 с) и
+// стартует заново с чистым счётчиком, так что окно не открывалось вовсе.
+//
+// provider передаётся ЯВНО, а не достаётся проверкой типа из `trans`: обёртки Transport не поднимают
+// ProvideCookies, и проверка типа на обёртке молча вернула бы false.
+const (
+	captchaWindowCooldown = 5 * time.Minute
+	retryReasonCaptcha    = "captcha"
+)
+
+var captchaWindow = solveCaptchaByWebView
 
 func attachCaptchaSolver(trans transport.Transport, provider transport.CookieProvider, profileDir string, mode captchaMode) {
 	solve := mode != captchaOff && provider != nil
 	var (
-		escalMu     sync.Mutex
-		firstSeenAt time.Time
+		mu            sync.Mutex
+		captchaURL    string
+		windowBlocked time.Time
 	)
-	trans.SetEventCallback(func(code, detail string) {
-		// ⛔ ПРИЧИНУ ОТКАЗА ОБЯЗАТЕЛЬНО ПРОПУСКАЕМ В LOG|.
-		// Транспорт честно отдаёт её в EventRetrying («попытка|задержка|код|текст»), а весь
-		// разбор сети идёт в utils.Debugf, который включён только при SETTING_debugLog. Без
-		// этого моста отказ соединения не оставляет НИ ОДНОЙ строки в логе модуля: хост
-		// видит лишь «соединение не поднялось», и диагностировать нечего.
-		if code == transport.EventRetrying {
-			parts := strings.SplitN(detail, "|", 4)
-			if len(parts) == 4 {
-				emitLog("OpenFlux: попытка %s не удалась, причина %s (%s), следующая через %sс",
-					parts[0], parts[2], parts[3], parts[1])
-				emitStatus(statusDegraded, "не удалось подключиться: "+parts[2])
-			} else {
-				emitLog("OpenFlux: попытка соединения не удалась: %s", detail)
-			}
-			return
-		}
-		if code == transport.EventConnected {
-			emitLog("OpenFlux: транспорт поднят (попытка %s)", detail)
-			emitStatus(statusOK, "транспорт поднят")
-			return
-		}
-		if code != transport.EventCaptchaRequired || detail == "" || !solve {
-			return
-		}
-		if mode == captchaAuto {
-			escalMu.Lock()
-			now := time.Now()
-			if firstSeenAt.IsZero() || now.Sub(firstSeenAt) > autoCaptchaEscalateWindow {
-				firstSeenAt = now
-				escalMu.Unlock()
-				return
-			}
-			escalMu.Unlock()
-		}
-		// Окно решается В ГОРУТИНЕ: событие эмитится синхронно из fetchDocInfo, и синхронное
-		// ожидание человека заблокировало бы read loop транспорта на минуты.
-		if !captchaPending.CompareAndSwap(false, true) {
+
+	openWindow := func() {
+		mu.Lock()
+		docURL, blocked := captchaURL, time.Now().Before(windowBlocked)
+		mu.Unlock()
+		if docURL == "" || blocked || !captchaPending.CompareAndSwap(false, true) {
 			return
 		}
 		go func() {
 			captchaWindowMu.Lock()
 			defer captchaWindowMu.Unlock()
-			jar, cancelled := solveCaptchaByWebView(profileDir, detail)
+			jar, cancelled := captchaWindow(profileDir, docURL)
 			captchaPending.Store(false)
-			if cancelled {
-				emitLog("OpenFlux: окно проверки закрыто без результата")
+			if cancelled || jar == "" {
+				mu.Lock()
+				windowBlocked = time.Now().Add(captchaWindowCooldown)
+				mu.Unlock()
+				if cancelled {
+					emitLog(ofText.captchaClosedLog)
+				} else {
+					emitLog(ofText.captchaNoCookiesLog)
+				}
 				return
 			}
-			if jar == "" {
-				emitLog("OpenFlux: окно проверки не вернуло cookie")
-				return
-			}
-			emitLog("OpenFlux: cookie из окна проверки получены, переподключаю транспорт")
+			emitLog(ofText.captchaGotCookiesLog)
 			provider.ProvideCookies(jar)
-			// Повтор не ждём следующего цикла backoff: cookie уже есть, ждать незачем.
 			trans.ForceReconnect()
 		}()
+	}
+
+	trans.SetEventCallback(func(code, detail string) {
+		switch code {
+		case transport.EventRetrying:
+			parts := strings.SplitN(detail, "|", 4)
+			if len(parts) != 4 {
+				emitLog(ofText.attemptFailedPlainFmt, detail)
+				return
+			}
+			emitLog(ofText.attemptFailedFmt, parts[0], parts[2], parts[3], parts[1])
+			emitStatus(statusDegraded, "connection attempt failed: "+parts[2])
+			if solve && strings.Contains(parts[2], retryReasonCaptcha) {
+				openWindow()
+			}
+		case transport.EventConnected:
+			emitLog(ofText.transportUpFmt, detail)
+			emitStatus(statusOK, "transport up")
+		case transport.EventCaptchaRequired:
+			if detail == "" {
+				return
+			}
+			mu.Lock()
+			captchaURL = detail
+			mu.Unlock()
+			if solve && mode == captchaWebviewOnly {
+				openWindow()
+			}
+		}
 	})
 }
 
