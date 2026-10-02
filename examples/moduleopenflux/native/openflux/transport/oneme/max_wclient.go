@@ -108,7 +108,12 @@ func (c *MaxClient) LoginByToken(token string) error {
 	}
 	c.loggedIn = true
 	go c.keepalive()
-	// AntiNet divergence from openflux-server: the account's contact list (names, phone numbers) is NOT printed. A helper's stdout is redirected by the host into `helper.stdout.log`, which people read and grep by hand and which goes into bug reports wholesale - third parties' phone numbers have no place in a VPN client's diagnostic log.
+	users := c.getUserMap(resp)
+	fmt.Println("\n=== CONTACTS ===")
+	for id, u := range users {
+		fmt.Printf("  ID: %d | %s %s | Phone: %d\n", id, u.FirstName, u.LastName, u.Phone)
+	}
+	fmt.Println()
 	return nil
 }
 

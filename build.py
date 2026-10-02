@@ -458,7 +458,19 @@ def check_toolchain(targets, mod=None, abis="arm64-v8a", api=26):
             problems.append(("Android NDK (переменная ANDROID_NDK_HOME / ANDROID_HOME/ndk/<ver>)",
                              INSTALL_HINTS["ndk"][HOST_OS]))
         else:
-            ok(f"Android NDK: {ndk}")
+            # Проверяем НЕ ТОЛЬКО корень NDK. Прерванная установка (например, sdkmanager
+            # прервали) оставляет каталог с одним лишь `.installer`, и старая проверка рапортовала
+            # «NDK есть», после чего сборка android падала, а в dist оставался ПРЕЖНИЙ .so — то
+            # есть релиз уходил с немолчащим устаревшим бинарём. Каталог с clang'ом и есть
+            # то, чем на самом деле пользуется сборка.
+            ndk_bin = Path(ndk) / "toolchains" / "llvm" / "prebuilt" / f"{HOST_OS}-x86_64" / "bin"
+            clang = next(ndk_bin.glob("*-linux-android*-clang"), None) if ndk_bin.is_dir() else None
+            if clang is None:
+                problems.append((f"Android NDK: каталог неполон, нет clang ({ndk_bin}). "
+                                 "Установка NDK прервана — переустановите NDK целиком",
+                                 INSTALL_HINTS["ndk"][HOST_OS]))
+            else:
+                ok(f"Android NDK: {ndk}  (clang: {clang.name})")
 
     # actionBinary — только если модуль его объявил И среди таргетов есть ХОСТОВАЯ ОС.
     # Кросс-компиляция здесь невозможна по построению (cgo + системные библиотеки цели), поэтому
@@ -834,11 +846,18 @@ def _module_tracked_files(modroot):
 def _rmtree_force(path):
     """rmtree, переживающий read-only файлы. На Windows объекты git-хранилища создаются
     read-only, и голый `shutil.rmtree` падает на них `PermissionError` — из-за этого `--package`
-    для masterdns не собирался вовсе (в его дереве лежит вендорнутая git-база)."""
-    def _onexc(func, p, exc):
+    для masterdns не собирался вовсе (в его дереве лежит вендорнутая git-база).
+
+    `onexc` у `shutil.rmtree` появился только в Python 3.12, а машина сборки может быть и на 3.11,
+    где тот же приём называется `onerror` и принимает функцию с той же сигнатурой. Поэтому ветка
+    выбирается по возможности, а не по версии интерпретатора."""
+    def _chmod_retry(func, p, exc=None):
         os.chmod(p, stat.S_IWRITE)
         func(p)
-    shutil.rmtree(path, onexc=_onexc)
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=_chmod_retry)
+    else:
+        shutil.rmtree(path, onerror=_chmod_retry)
 
 
 def _nested_licenses(mod):

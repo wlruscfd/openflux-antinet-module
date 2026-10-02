@@ -4,10 +4,10 @@
     "openflux"
   ],
   "name": "OpenFlux",
-  "description": "TCP-туннель поверх мессенджеров: трафик уходит сообщениями курсора Яндекс.Документов либо сигнальным каналом звонка MAX. Транспорт выбирается ссылкой. Требуется свой exit-node OpenFlux.",
+  "description": "TCP-туннель поверх облачных сервисов и мессенджеров: Яндекс.Документы, Яндекс.Доски, Mail.ru, MTS Link, MAX. Транспорт и шифрование выбираются ссылкой от вашего сервера. Требуется свой exit-node OpenFlux.",
   "homepage": "https://github.com/p1neappleXpress/OpenFlux",
   "updateUrl": "https://raw.githubusercontent.com/wlruscfd/openflux-antinet-module/main/antinet-module.json",
-  "version": "1.1.3",
+  "version": "1.3.0",
   "license": "GPL-3.0-or-later",
   "handoverMode": "signal",
   "hostEvents": ["handover", "netlost", "netback", "stall", "dns"],
@@ -37,6 +37,18 @@
       "description": "Как часто слать пустое сообщение, чтобы канал мессенджера не закрыли по простою. Реже — меньше следов, но выше риск обрыва."
     },
     {
+      "key": "captchaMode",
+      "type": "choice",
+      "label": "Проверка Яндекса",
+      "default": "auto",
+      "options": [
+        {"id": "auto", "label": "Авто, окно при необходимости"},
+        {"id": "wv", "label": "Всегда окно"},
+        {"id": "off", "label": "Не решать (PoW внутри модуля)"}
+      ],
+      "description": "Как проходить проверку Яндекс.Документов. «Авто» сначала решает её внутри модуля, а окно открывает только если не вышло. «Всегда окно» открывает окно сразу и тратит ресурсы модуля впустую. «Не решать» оставляет только внутренний PoW."
+    },
+    {
       "key": "debugLog",
       "type": "bool",
       "label": "Подробный лог",
@@ -54,7 +66,7 @@
     "ldflags": "-checklinkname=0",
     "upstream": {
       "url": "https://github.com/wlruscfd/openflux-server",
-      "base": "d2b857dd9742838c76b3c07687f57453720244c1",
+      "base": "e1a02dcbaa6abe1a21f6998088d58ca4dbef97f5",
       "take": "ours"
     }
   }

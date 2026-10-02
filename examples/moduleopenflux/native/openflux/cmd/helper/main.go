@@ -22,12 +22,16 @@ import (
 	"log"
 	"net"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"universal-bypass-tool/transport"
+	"universal-bypass-tool/transport/mailru"
+	"universal-bypass-tool/transport/mts"
 	"universal-bypass-tool/transport/oneme"
 	"universal-bypass-tool/transport/yandex"
 	"universal-bypass-tool/tunnel"
@@ -65,7 +69,11 @@ const (
 	linkHostImport   = "import" // openflux://import?data=... — см. decodeImportLink
 	transportYandex  = "yandex"
 	transportOneMe   = "oneme"
-	transportVolga   = "volga" // распознаётся, но пока не портирован в этот модуль — см. decodeImportLink
+	transportVolga   = "volga"
+	transportMailru  = "mailru"
+	transportBoards  = "boards"
+	transportMTS     = "mts"
+	transportMulti   = "yandex_multistream"
 	defaultDialSec   = 15
 	defaultKeepSec   = 10
 	readyWaitBudget  = 90 * time.Second // см. waitTransportUp
@@ -137,11 +145,40 @@ func ofStringsFor(lang string) ofStrings {
 // openFluxLink — разобранная ссылка. Поля повторяют флаги апстрима, чтобы сверка «что приехало»
 // сводилась к чтению одной структуры.
 type openFluxLink struct {
-	Transport string // yandex | oneme
-	URL       string // yandex: адрес документа
-	Token     string // oneme: токен MAX
-	UID       int64  // oneme: id собеседника (exit-node)
-	Name      string // фрагмент ссылки — имя для карточки конфига
+	Transport string   // yandex | volga | mailru | boards | mts | yandex_multistream | oneme
+	URL       string   // doc-транспорты: адрес документа/доски
+	URLs      []string // yandex_multistream: адреса документов, по одному на поток
+	Token     string   // oneme: токен MAX
+	UID       int64    // oneme: id собеседника (exit-node)
+	KeyToken  string   // токен ключа controlplane: из него выводятся ключи E2E
+	E2E       bool     // сквозное шифрование: exit-node ждёт его, если ключ создан с e2e
+	Name      string   // фрагмент ссылки — имя для карточки конфига
+}
+
+func isDocTransport(name string) bool {
+	switch name {
+	case transportYandex, transportVolga, transportMailru, transportBoards, transportMTS:
+		return true
+	}
+	return false
+}
+
+func parseBoolParam(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+func nonEmptyTrimmed(in []string) []string {
+	var out []string
+	for _, s := range in {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // parseOpenFluxLink — ЕДИНЫЙ декодер ссылки: его зовут и коннект-путь, и `summarize`, и
@@ -165,32 +202,36 @@ func parseOpenFluxLink(raw string) (openFluxLink, error) {
 	l.Name = strings.TrimSpace(u.Fragment)
 	q := u.Query()
 
-	// openflux-server's own deep-link shape - see decodeImportLink's doc
-	// comment. Unwraps to the same {Transport, URL, Name} shape the plain
-	// yandex/oneme forms below produce, so everything past this point
-	// (server(), displayName(), the connect path) treats it identically.
 	if host == linkHostImport {
-		tr, docURL, name, derr := decodeImportLink(q)
+		imported, derr := decodeImportLink(q)
 		if derr != nil {
 			return l, derr
 		}
-		if name != "" {
-			l.Name = name
+		if imported.Name == "" {
+			imported.Name = l.Name
 		}
-		host = tr
-		l.URL = docURL
+		return imported, nil
 	}
 
+	if host == "multistream" {
+		host = transportMulti
+	}
 	l.Transport = host
-	switch l.Transport {
-	case transportYandex:
-		if l.URL == "" { // not already set by decodeImportLink above
-			l.URL = strings.TrimSpace(q.Get("url"))
-		}
+	l.KeyToken = strings.TrimSpace(q.Get("key"))
+	l.E2E = parseBoolParam(q.Get("e2e"))
+	switch {
+	case isDocTransport(l.Transport):
+		l.URL = strings.TrimSpace(q.Get("url"))
 		if l.URL == "" {
-			return l, fmt.Errorf("%s: missing url=", transportYandex)
+			return l, fmt.Errorf("%s: missing url=", l.Transport)
 		}
-	case transportOneMe:
+	case l.Transport == transportMulti:
+		l.URLs = nonEmptyTrimmed(q["url"])
+		if len(l.URLs) < 2 {
+			return l, fmt.Errorf("%s: needs at least two url= parameters", transportMulti)
+		}
+		l.URL = l.URLs[0]
+	case l.Transport == transportOneMe:
 		l.Token = strings.TrimSpace(q.Get("token"))
 		if l.Token == "" {
 			return l, fmt.Errorf("%s: missing token=", transportOneMe)
@@ -200,62 +241,79 @@ func parseOpenFluxLink(raw string) (openFluxLink, error) {
 			return l, fmt.Errorf("%s: missing or malformed uid=", transportOneMe)
 		}
 		l.UID = uid
-	case transportVolga:
-		return l, fmt.Errorf("%s: transport not supported by this module build yet", transportVolga)
 	default:
-		return l, fmt.Errorf("unknown transport %q (want %s|%s)", l.Transport, transportYandex, transportOneMe)
+		return l, fmt.Errorf("unknown transport %q (want %s|%s|%s|%s|%s|%s|%s)", l.Transport,
+			transportYandex, transportVolga, transportMailru, transportBoards, transportMTS, transportMulti, transportOneMe)
 	}
 	return l, nil
 }
 
-// decodeImportLink parses openflux-server's deep-link payload
-// (openflux://import?data=<base64url-no-pad JSON>, see this file's header
-// comment for the exact JSON shape and https://github.com/wlruscfd/openflux-server's
-// controlplane/internal/api/deeplink.go for where it's generated). Returns
-// the transport name and, for yandex, the doc URL directly out of the
-// link - never dials control_url, for the same reason the fork's own
-// Android app doesn't: that request would go to a bare IP with none of the
-// tunnel's own disguise.
-func decodeImportLink(q url.Values) (transportName, docURL, name string, err error) {
+// decodeImportLink разбирает deep-link controlplane (openflux://import?data=<base64url JSON>, см.
+// controlplane/internal/api/deeplink.go) целиком, включая key_token и e2e_encryption: без них
+// exit-node, ждущий шифрованный поток, получал бы от модуля открытый — туннель поднимался, а трафик
+// не шёл. На control_url модуль не ходит: запрос на голый IP летел бы без маскировки транспорта.
+func decodeImportLink(q url.Values) (openFluxLink, error) {
+	var l openFluxLink
 	raw, derr := base64.RawURLEncoding.DecodeString(q.Get("data"))
 	if derr != nil {
-		return "", "", "", fmt.Errorf("import: bad data= (%w)", derr)
+		return l, fmt.Errorf("import: bad data= (%w)", derr)
 	}
 	var m map[string]any
 	if jerr := json.Unmarshal(raw, &m); jerr != nil {
-		return "", "", "", fmt.Errorf("import: data= is not JSON (%w)", jerr)
+		return l, fmt.Errorf("import: data= is not JSON (%w)", jerr)
 	}
 	str := func(k string) string {
 		v, _ := m[k].(string)
 		return strings.TrimSpace(v)
 	}
 
-	transportName = strings.ToLower(str("transport"))
-	if transportName == "" {
-		transportName = transportYandex // openflux-server's own default (mobile.buildTransport)
+	l.Transport = strings.ToLower(str("transport"))
+	if l.Transport == "" {
+		l.Transport = transportYandex
 	}
-	if transportName != transportYandex && transportName != transportVolga {
-		return "", "", "", fmt.Errorf("import: unsupported transport %q", transportName)
-	}
+	l.Name = str("name")
+	l.KeyToken = str("key_token")
+	l.E2E, _ = m["e2e_encryption"].(bool)
 
-	docURL = str("doc_url")
-	if docURL == "" {
-		return "", "", "", fmt.Errorf("import: missing doc_url")
+	switch {
+	case isDocTransport(l.Transport):
+		l.URL = str("doc_url")
+		if l.URL == "" {
+			return l, fmt.Errorf("import: missing doc_url")
+		}
+	case l.Transport == transportMulti:
+		if list, ok := m["doc_urls"].([]any); ok {
+			for _, v := range list {
+				s, _ := v.(string)
+				l.URLs = append(l.URLs, s)
+			}
+		}
+		l.URLs = nonEmptyTrimmed(l.URLs)
+		if len(l.URLs) < 2 {
+			return l, fmt.Errorf("import: %s needs at least two doc_urls", transportMulti)
+		}
+		l.URL = l.URLs[0]
+	default:
+		return l, fmt.Errorf("import: unsupported transport %q", l.Transport)
 	}
-	return transportName, docURL, str("name"), nil
+	return l, nil
 }
 
 // server — что показать в карточке конфига как «сервер». Для yandex это хост документа, для
 // oneme — сигнальный хост MAX плюс id собеседника: два конфига одного транспорта обязаны
 // РАЗЛИЧАТЬСЯ в списке, иначе карточка врёт.
 func (l openFluxLink) server() string {
-	if l.Transport == transportYandex {
-		if u, err := url.Parse(l.URL); err == nil && u.Host != "" {
-			return u.Host
-		}
-		return l.URL
+	if l.Transport == transportOneMe {
+		return "max.ru:" + strconv.FormatInt(l.UID, 10)
 	}
-	return "max.ru:" + strconv.FormatInt(l.UID, 10)
+	host := l.URL
+	if u, err := url.Parse(l.URL); err == nil && u.Host != "" {
+		host = u.Host
+	}
+	if n := len(l.URLs); n > 1 {
+		return fmt.Sprintf("%s (+%d)", host, n-1)
+	}
+	return host
 }
 
 // displayName — имя для карточки: фрагмент ссылки, иначе — осмысленный дефолт по транспорту.
@@ -263,10 +321,13 @@ func (l openFluxLink) displayName() string {
 	if l.Name != "" {
 		return l.Name
 	}
-	if l.Transport == transportYandex {
-		return "OpenFlux Yandex"
+	if l.Transport == transportOneMe {
+		return "OpenFlux MAX"
 	}
-	return "OpenFlux MAX"
+	if l.Transport == transportMulti {
+		return "OpenFlux Multistream"
+	}
+	return "OpenFlux " + strings.ToUpper(l.Transport[:1]) + l.Transport[1:]
 }
 
 // normalizeOpenFlux — НЕ-link формы (JSON / base64-JSON) → канонический openflux://-link
@@ -290,13 +351,23 @@ func normalizeOpenFlux(raw string) string {
 	}
 	tr := strings.ToLower(str("transport"))
 	q := url.Values{}
-	switch tr {
-	case transportYandex:
-		if str("url") == "" {
+	switch {
+	case isDocTransport(tr):
+		docURL := str("url")
+		if docURL == "" {
+			docURL = str("doc_url")
+		}
+		if docURL == "" {
 			return ""
 		}
-		q.Set("url", str("url"))
-	case transportOneMe:
+		q.Set("url", docURL)
+		if key := str("key_token"); key != "" {
+			q.Set("key", key)
+			if e2e, _ := m["e2e_encryption"].(bool); e2e {
+				q.Set("e2e", "1")
+			}
+		}
+	case tr == transportOneMe:
 		uid := str("uid")
 		if uid == "" {
 			if f, ok := m["uid"].(float64); ok {
@@ -411,18 +482,15 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		tcfg.KeepAliveInterval = keepAlive
 	}
 
-	var trans transport.Transport
-	var hoTransport handoverer
-	switch link.Transport {
-	case transportYandex:
-		yt := yandex.NewYandexDocsTransport(link.URL, tcfg)
-		trans = transport.NewCompressedTransport(yt)
-		hoTransport = yt
-	default:
-		ot := oneme.NewOneMeTransport(false, link.Token, link.UID, tcfg)
-		trans = transport.NewCompressedTransport(ot)
-		hoTransport = ot
+	mode := parseCaptchaMode(cfg["SETTING_captchaMode"])
+	built, err := buildTransport(link, tcfg, mode)
+	if err != nil {
+		emitLog(s.badLinkFmt, err)
+		emitStatus(statusFatal, "bad link")
+		log.Fatalf("build transport: %v", err)
 	}
+	trans, hoTransport := built.trans, built.handover
+	attachCaptchaSolver(trans, built.cookies, profileDir, mode)
 
 	emitProgress(s.openingTransportFmt, link.Transport)
 	if err := trans.Start(); err != nil {
@@ -515,7 +583,7 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		log.Fatalf("transport did not come up within %s", readyWaitBudget)
 	}
 
-	tun := tunnel.NewTCPTunnel(trans)
+	tun := tunnel.NewTCPTunnel(trans, false)
 
 	ln, err := openListener(port, listenFd)
 	if err != nil {
@@ -539,6 +607,81 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		handleConn(c, user, pass, tun, resolver, dialTimeout)
 	})
 	return 0
+}
+
+// builtTransport — собранный по ссылке транспорт плюс те его грани, которые модулю нужны отдельно:
+// хендовер и приём cookie из окна проверки. Обёртки (шифрование, батчинг) эти методы не поднимают,
+// поэтому брать их с обёртки нельзя — проверка типа молча дала бы false.
+type builtTransport struct {
+	trans    transport.Transport
+	handover handoverer
+	cookies  transport.CookieProvider
+}
+
+type reconnectHandover struct{ t transport.Transport }
+
+func (r reconnectHandover) Handover() { r.t.ForceReconnect() }
+
+// buildTransport повторяет сборку клиента openflux-server (mobile.buildTransport): способ упаковки
+// и шифрования обязан совпасть с тем, что ждёт exit-node для этого ключа, иначе транспорт поднимется,
+// а кадры друг друга стороны разобрать не смогут.
+func buildTransport(link openFluxLink, tcfg transport.TransportConfig, mode captchaMode) (builtTransport, error) {
+	e2e := link.E2E && link.KeyToken != ""
+	wrapGeneric := func(inner transport.Transport) transport.Transport {
+		if e2e {
+			inner = transport.NewEncryptedTransport(inner, link.KeyToken, false)
+		}
+		return transport.NewCompressedTransport(inner)
+	}
+	newYandexDoc := func(docURL string, streamIdx int) *yandex.YandexDocsTransport {
+		yt := yandex.NewYandexDocsTransport(docURL, tcfg)
+		// Без явного режима поле пустое, а пустое — это Off: транспорт отдаёт errCaptchaBlocked, не
+		// пробуя решить, и модуль не поднимается никогда.
+		yt.SetCaptchaSolveMode(captchaSolveModeFor(mode))
+		switch {
+		case !e2e:
+			yt.EnableSelfCompression()
+		case streamIdx >= 0:
+			yt.EnableEncryptedSelfCompressionForStream(link.KeyToken, false, streamIdx)
+		default:
+			yt.EnableEncryptedSelfCompression(link.KeyToken, false)
+		}
+		return yt
+	}
+
+	switch link.Transport {
+	case transportYandex:
+		yt := newYandexDoc(link.URL, -1)
+		return builtTransport{trans: yt, handover: yt, cookies: yt}, nil
+	case transportMulti:
+		streams := make([]transport.Transport, len(link.URLs))
+		for i, docURL := range link.URLs {
+			streams[i] = newYandexDoc(docURL, i)
+		}
+		ms := transport.NewMultiStreamTransport(streams)
+		return builtTransport{trans: ms, handover: reconnectHandover{ms}, cookies: ms}, nil
+	case transportVolga:
+		vt := yandex.NewYandexVolgaTransport(link.URL, tcfg)
+		return builtTransport{trans: wrapGeneric(vt), handover: reconnectHandover{vt}}, nil
+	case transportBoards:
+		bt := yandex.NewBoardsTransport(link.URL, tcfg)
+		bt.SetCaptchaSolveMode(captchaSolveModeFor(mode))
+		var inner transport.Transport = bt
+		if e2e {
+			inner = transport.NewEncryptedTransport(inner, link.KeyToken, false)
+		}
+		return builtTransport{trans: transport.NewBatchedTransport(inner), handover: reconnectHandover{bt}, cookies: bt}, nil
+	case transportMailru:
+		mt := mailru.NewMailruDocsTransport(link.URL, tcfg)
+		return builtTransport{trans: wrapGeneric(mt), handover: reconnectHandover{mt}}, nil
+	case transportMTS:
+		st := mts.NewTransport(link.URL, tcfg)
+		return builtTransport{trans: wrapGeneric(st), handover: reconnectHandover{st}}, nil
+	case transportOneMe:
+		ot := oneme.NewOneMeTransport(false, link.Token, link.UID, tcfg)
+		return builtTransport{trans: wrapGeneric(ot), handover: ot}, nil
+	}
+	return builtTransport{}, fmt.Errorf("unsupported transport %q", link.Transport)
 }
 
 // settingDuration — значение настройки в секундах (MODULE_API §2.11). Непарсящееся/нулевое →
@@ -623,9 +766,28 @@ func handleConn(c net.Conn, user, pass string, tun *tunnel.TCPTunnel, resolver *
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
-	up, err := tun.DialTCP(ctx, net.JoinHostPort(ip, strconv.Itoa(int(req.Port))))
-	cancel()
+	// DialTCP больше не принимает контекст: бюджет дозвона держим сами, иначе настройка
+	// dialTimeoutSec перестала бы влиять и заведомо недостижимая цель висела бы до общего
+	// таймаута транспорта.
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	results := make(chan dialResult, 1)
+	go func() {
+		c, err := tun.DialTCP(net.JoinHostPort(ip, strconv.Itoa(int(req.Port))))
+		results <- dialResult{c, err}
+	}()
+
+	var up net.Conn
+	var err error
+	select {
+	case res := <-results:
+		up = res.conn
+		err = res.err
+	case <-time.After(dialTimeout):
+		err = context.DeadlineExceeded
+	}
 	if err != nil {
 		log.Printf("[SOCKS] tunnel dial FAILED target=%s ip=%s elapsed=%v err=%v", target, ip, time.Since(dialStart), err)
 		_, _ = c.Write(socksRep(0x01))
@@ -665,6 +827,193 @@ func resolveV4(req socksRequest, resolver *protectedResolver) (string, error) {
 // живёт в transport.go, который обязан оставаться дословной копией openflux-server (см. этого
 // файла шапку и examples/moduleopenflux/README.md) — добавлять в него что-то модульное нельзя.
 type handoverer interface{ Handover() }
+
+// captchaMode — §2.11: как модуль разбирается с проверкой Яндекса.
+type captchaMode int
+
+const (
+	captchaAuto captchaMode = iota
+	captchaWebviewOnly
+	captchaOff
+)
+
+func parseCaptchaMode(raw string) captchaMode {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "wv", "webview":
+		return captchaWebviewOnly
+	case "off", "none":
+		return captchaOff
+	default:
+		return captchaAuto
+	}
+}
+
+// captchaSolveModeFor переводит настройку модуля в режим транспорта.
+//
+// ⛔ auto ОБЯЗАН давать Native. Пустое значение (то, что стоит после конструктора) — это Off,
+// а Off означает «капчу не решать»: транспорт вернёт errCaptchaBlocked и в модуле не поднимется
+// вовсе, хост будет перезапускать его каждые readyWaitBudget. Именно так модуль и не подключался.
+func captchaSolveModeFor(mode captchaMode) yandex.CaptchaSolveMode {
+	switch mode {
+	case captchaWebviewOnly:
+		// Проверку решает окно хоста, внутренний PoW не тратим.
+		return yandex.CaptchaSolveModeExternal
+	case captchaOff:
+		return yandex.CaptchaSolveModeOff
+	default:
+		return yandex.CaptchaSolveModeNative
+	}
+}
+
+// cookieUserAgent удалён: UA берётся у транспорта (yandex.BrowserUserAgent), иначе окно и сеть
+// разошлись бы по UA и пропуск не засчитался бы.
+
+// captchaWindowMu — одно окно на капчу: транспорт шлёт событие на каждой неудачной попытке, и
+// без замка хост получил бы пачку окон вместо одного.
+var captchaWindowMu sync.Mutex
+
+// solveCaptchaByWebView открывает окно webview, которое рисует хост (§2.7), и возвращает
+// заголовок `Cookie` для транспорта. Cookie приходят ВКЛЮЧАЯ HttpOnly — ради этого и нужен
+// `collectCookies`: из JS страницы сессионные cookie недоступны, а без них проверка не пройдена.
+//
+// Правило строится по объявленным хостом возможностям (HOST_FEATURES): поле, которого хост не знает,
+// он молча выбрасывает, и тогда окно либо не закроется само (без leavePattern), либо вернётся
+// вовсе без cookie — тихий сбой без единой ошибки.
+//
+// Второй аргумент — `cancelled`: различать «человек закрыл окно» и «окно не дало cookie».
+func solveCaptchaByWebView(profileDir, docURL string) (string, bool) {
+	if !hostSupports("webview.cookies") {
+		// ⛔ Раньше здесь был молчаливый return, и это стоило диагностики: хост не умеет
+		// отдавать HttpOnly-куки, окно всё равно было бы бесполезным, но модуль об этом
+		// не говорил ни слова — выглядело как «ничего не происходит».
+		emitLog("OpenFlux: хост не объявил webview.cookies — окно капчи использовать нечем, " +
+			"переключите «Проверка Яндекса» в режим auto")
+		return "", false
+	}
+	ids := fmt.Sprintf("of-captcha-%d", time.Now().UnixNano())
+	rule := map[string]any{
+		"type":           "webview",
+		"title":          "Проверка Яндекса",
+		"text":           "Пройдите проверку в этом окне — оно закроется само, когда проверка будет пройдена.",
+		"url":            docURL,
+		"userAgent":      yandex.BrowserUserAgent(),
+		"collectCookies": true,
+	}
+	if hostSupports("webview.leavePattern") {
+		// Страница, которая вернула человека к проверке, успехом не считается.
+		rule["leavePattern"] = []string{"showcaptcha", "passport.yandex"}
+	}
+	if hostSupports("webview.doneButton") {
+		rule["doneButton"] = true
+	}
+	res, cancelled := runAction(profileDir, ids, rule)
+	if cancelled {
+		return "", true
+	}
+	jar := actionResultCookieJar(res)
+	return cookieHeader(jar), false
+}
+
+// cookieHeader собирает заголовок `Cookie` из jar'а «имя → значение». Порядок сортируется, иначе
+// заголовок скакал бы от запуска к запуску (итерация по карте случайна), а Яндекс иногда
+// чувствителен к порядку пар. Значения не экранируются: они уже пришли от хоста готовыми.
+func cookieHeader(jar map[string]string) string {
+	if len(jar) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(jar))
+	for name := range jar {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, name := range names {
+		parts = append(parts, name+"="+jar[name])
+	}
+	return strings.Join(parts, "; ")
+}
+
+// attachCaptchaSolver подписывает helper'а на событие проверки транспорта и кормит его cookie'ами
+// из окна хоста. `auto` сперва пробует PoW внутри транспорта, а к окну идёт только когда тот не
+// справился, — иначе каждое напоминание о проверке требовало бы лишнего клика человека.
+//
+// provider передаётся ЯВНО, а не достаётся проверкой типа из `trans`: CompressedTransport встраивает
+// интерфейс Transport и не поднимает ProvideCookies, который в этом интерфейсе не значится. Проверка
+// типа на обёртке молча вернула бы false — и капча просто не решалась бы, без всякой ошибки.
+// autoCaptchaEscalateWindow — сколько ждать, прежде чем в `auto` звать человека.
+// Событие о проверке приходит ДО попытки внутреннего PoW, поэтому в `auto` первое событие
+// игнорируем: даём модулю решить проверку самому. Окно открываем, только если проверка
+// вернулась снова — то есть PoW не справился.
+const autoCaptchaEscalateWindow = 90 * time.Second
+
+func attachCaptchaSolver(trans transport.Transport, provider transport.CookieProvider, profileDir string, mode captchaMode) {
+	solve := mode != captchaOff && provider != nil
+	var (
+		escalMu     sync.Mutex
+		firstSeenAt time.Time
+	)
+	trans.SetEventCallback(func(code, detail string) {
+		// ⛔ ПРИЧИНУ ОТКАЗА ОБЯЗАТЕЛЬНО ПРОПУСКАЕМ В LOG|.
+		// Транспорт честно отдаёт её в EventRetrying («попытка|задержка|код|текст»), а весь
+		// разбор сети идёт в utils.Debugf, который включён только при SETTING_debugLog. Без
+		// этого моста отказ соединения не оставляет НИ ОДНОЙ строки в логе модуля: хост
+		// видит лишь «соединение не поднялось», и диагностировать нечего.
+		if code == transport.EventRetrying {
+			parts := strings.SplitN(detail, "|", 4)
+			if len(parts) == 4 {
+				emitLog("OpenFlux: попытка %s не удалась, причина %s (%s), следующая через %sс",
+					parts[0], parts[2], parts[3], parts[1])
+				emitStatus(statusDegraded, "не удалось подключиться: "+parts[2])
+			} else {
+				emitLog("OpenFlux: попытка соединения не удалась: %s", detail)
+			}
+			return
+		}
+		if code == transport.EventConnected {
+			emitLog("OpenFlux: транспорт поднят (попытка %s)", detail)
+			emitStatus(statusOK, "транспорт поднят")
+			return
+		}
+		if code != transport.EventCaptchaRequired || detail == "" || !solve {
+			return
+		}
+		if mode == captchaAuto {
+			escalMu.Lock()
+			now := time.Now()
+			if firstSeenAt.IsZero() || now.Sub(firstSeenAt) > autoCaptchaEscalateWindow {
+				firstSeenAt = now
+				escalMu.Unlock()
+				return
+			}
+			escalMu.Unlock()
+		}
+		// Окно решается В ГОРУТИНЕ: событие эмитится синхронно из fetchDocInfo, и синхронное
+		// ожидание человека заблокировало бы read loop транспорта на минуты.
+		if !captchaPending.CompareAndSwap(false, true) {
+			return
+		}
+		go func() {
+			captchaWindowMu.Lock()
+			defer captchaWindowMu.Unlock()
+			jar, cancelled := solveCaptchaByWebView(profileDir, detail)
+			captchaPending.Store(false)
+			if cancelled {
+				emitLog("OpenFlux: окно проверки закрыто без результата")
+				return
+			}
+			if jar == "" {
+				emitLog("OpenFlux: окно проверки не вернуло cookie")
+				return
+			}
+			emitLog("OpenFlux: cookie из окна проверки получены, переподключаю транспорт")
+			provider.ProvideCookies(jar)
+			// Повтор не ждём следующего цикла backoff: cookie уже есть, ждать незачем.
+			trans.ForceReconnect()
+		}()
+	})
+}
+
+var captchaPending atomic.Bool
 
 // parseDNSEvent — разбор события хоста `dns=<ip[,ip...]>` (MODULE_API §2.8). `true` — событие
 // ИМЕННО это; на любом другом возвращает `false`, и вызывающий идёт своим `switch`.

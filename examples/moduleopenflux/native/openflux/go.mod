@@ -1,32 +1,29 @@
-// OpenFlux — helper протокол-модуля AntiNet. Порт КЛИЕНТСКОЙ половины
-// https://github.com/p1neappleXpress/OpenFlux (GPL-3.0, база a8a8937).
-//
-// Имя модуля намеренно оставлено апстримным (`universal-bypass-tool`): так импорты во всех
-// портированных файлах совпадают с апстримом байт-в-байт и не попадают в патч — ровно та же
-// политика, что у moduleqwdtt (`wg-turn-client`) и modulemasterdns (`masterdnsvpn-go`).
 module universal-bypass-tool
 
 go 1.26.4
 
+require github.com/gorilla/websocket v1.5.3
+
+require gvisor.dev/gvisor v0.0.0-20260530041128-23ef90c42be7
+
 require (
-	github.com/gorilla/websocket v1.5.3
-	github.com/pierrec/lz4/v4 v4.1.27
-	github.com/pion/webrtc/v3 v3.3.6
-	gvisor.dev/gvisor v0.0.0-20260530041128-23ef90c42be7
+	github.com/google/btree v1.1.2 // indirect
+	golang.org/x/exp v0.0.0-20250711185948-6ae5c78190dc // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/time v0.15.0 // indirect
 )
 
 require (
-	github.com/chromedp/cdproto v0.0.0-20260714215040-dc233986426f
-	github.com/chromedp/chromedp v0.16.0
-	github.com/chromedp/sysutil v1.1.0 // indirect
-	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
-	github.com/go-json-experiment/json v0.0.0-20260623181947-01eb4420fa68 // indirect
-	github.com/gobwas/httphead v0.1.0 // indirect
-	github.com/gobwas/pool v0.2.1 // indirect
-	github.com/gobwas/ws v1.4.0 // indirect
-	github.com/google/btree v1.1.2 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/klauspost/compress v1.18.0
+	github.com/pierrec/lz4/v4 v4.1.27
+	github.com/pion/webrtc/v3 v3.3.6
+	github.com/xjasonlyu/windivert-go v0.0.0-20201010013527-4239d0afa76f
+	golang.org/x/crypto v0.57.0
+)
+
+require (
+	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/pion/datachannel v1.5.8 // indirect
 	github.com/pion/dtls/v2 v2.2.12 // indirect
 	github.com/pion/ice/v2 v2.3.38 // indirect
@@ -44,13 +41,13 @@ require (
 	github.com/pion/turn/v2 v2.1.6 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/stretchr/testify v1.9.0 // indirect
-	github.com/wlynxg/anet v0.0.3 // indirect
-	golang.org/x/crypto v0.51.0
-	golang.org/x/exp v0.0.0-20250711185948-6ae5c78190dc // indirect
-	// dnsmessage — protected off-tunnel резолвер helper'а (cmd/helper/dns.go).
-	golang.org/x/net v0.55.0 // indirect
-	// unix.Prctl — канон shared/lifecycle, инжектируемый build.py в main-пакет helper'а.
-	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/time v0.15.0 // indirect
+	github.com/wlynxg/anet v0.0.5 // indirect
+	golang.org/x/mobile v0.0.0-20260908204917-8b95e45f8d3e // indirect
+	golang.org/x/mod v0.41.0 // indirect
+	golang.org/x/net v0.59.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/tools v0.50.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+tool golang.org/x/mobile/cmd/gobind

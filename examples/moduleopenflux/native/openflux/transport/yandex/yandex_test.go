@@ -6,9 +6,11 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -946,6 +948,237 @@ func TestScheduleReconnectStripsNewlinesFromCause(t *testing.T) {
 
 	if strings.Contains(gotDetail, "\n") {
 		t.Errorf("detail = %q, should not contain a literal newline", gotDetail)
+	}
+}
+
+func TestProvidedCookiesSurviveShareLinkRedirect(t *testing.T) {
+	// A /i/ share link redirects to /edit/d/... . Without a root cookie path the jar scopes the
+	// session cookies to /i and the redirect hop goes out nearly anonymous, which Yandex
+	// answers with a captcha instead of the document.
+	var gotSecondHop []*http.Cookie
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	mux.HandleFunc("/i/doc", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, srv.URL+"/edit/d/real?from_public=1", http.StatusFound)
+	})
+	mux.HandleFunc("/edit/d/real", func(w http.ResponseWriter, r *http.Request) {
+		gotSecondHop = parseCookieHeader(r.Header.Get("Cookie"))
+		w.Write([]byte(`<script type="application/json" id="client-config">{"officeActionData":{}}</script>`))
+	})
+
+	tr := NewYandexDocsTransport(srv.URL+"/i/doc", transport.DefaultConfig())
+	tr.ProvideCookies("i=session; yandexuid=42; yashr=7")
+
+	tr.fetchDocInfo(srv.URL+"/i/doc", "user1")
+
+	if gotSecondHop == nil {
+		t.Fatal("the redirect hop never happened")
+	}
+	names := map[string]bool{}
+	for _, c := range gotSecondHop {
+		names[c.Name] = true
+	}
+	for _, want := range []string{"i", "yandexuid", "yashr"} {
+		if !names[want] {
+			t.Errorf("cookie %q missing on the redirect hop, got %v", want, names)
+		}
+	}
+}
+
+func TestProvideCookiesIgnoresIdenticalJar(t *testing.T) {
+	tr := NewYandexDocsTransport("http://unused.invalid", transport.DefaultConfig())
+	tr.BaseTransport.Start()
+	defer tr.Stop()
+
+	tr.ProvideCookies("a=1; b=2")
+	afterFirst := tr.captchaCookieGeneration.Load()
+
+	tr.ProvideCookies("a=1; b=2")
+	if got := tr.captchaCookieGeneration.Load(); got != afterFirst {
+		t.Errorf("generation = %d after a repeated identical push, want %d - a no-op push must not force a reconnect", got, afterFirst)
+	}
+
+	// The WebView rebuilds the header from a map, so the same jar arrives in a new order.
+	tr.ProvideCookies("b=2; a=1")
+	if got := tr.captchaCookieGeneration.Load(); got != afterFirst {
+		t.Errorf("generation = %d after a re-ordered identical jar, want %d", got, afterFirst)
+	}
+
+	tr.ProvideCookies("a=1; b=3")
+	if got := tr.captchaCookieGeneration.Load(); got == afterFirst {
+		t.Error("generation unchanged after a genuinely different jar")
+	}
+}
+
+func TestCaptchaCooldownHonoursUnchangedCookiePushes(t *testing.T) {
+	// The loop the client hit: the WebView re-pushed the identical jar on every poll and
+	// each push cut the cooldown short, so the captcha prompt re-opened about once a second.
+	// An unchanged jar must therefore not interrupt the wait at all.
+	const minDelay = 400 * time.Millisecond
+
+	tr := NewYandexDocsTransport("http://unused.invalid", transport.TransportConfig{
+		ReconnectDelay:       time.Millisecond,
+		ReconnectMultiplier:  1,
+		MaxReconnectAttempts: 999,
+	})
+	tr.BaseTransport.Start()
+	defer tr.Stop()
+
+	tr.ProvideCookies("a=1; b=2")
+
+	var once sync.Once
+	tr.SetEventCallback(func(code, detail string) {
+		if code == transport.EventRetrying {
+			once.Do(func() { tr.Stop() })
+		}
+	})
+
+	returned := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		tr.scheduleReconnectWithMinDelay(0, reasonCaptchaBlocked, errors.New("captcha"), minDelay)
+		returned <- time.Since(start)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	for i := 0; i < 6; i++ {
+		tr.ProvideCookies("b=2; a=1")
+		time.Sleep(30 * time.Millisecond)
+	}
+
+	select {
+	case took := <-returned:
+		if took < minDelay {
+			t.Errorf("waited %v, want at least %v - a re-push of the same jar cut the cooldown short", took, minDelay)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("scheduleReconnectWithMinDelay never returned")
+	}
+}
+
+func TestChurningCookiePushesCannotHotLoop(t *testing.T) {
+	// The jar keeps changing between polls, so comparing contents is not enough on its own.
+	// A long cooldown must survive 40 churning pushes without being cut short a second time.
+	tr := NewYandexDocsTransport("http://unused.invalid", transport.TransportConfig{
+		ReconnectDelay:       time.Millisecond,
+		ReconnectMultiplier:  1,
+		MaxReconnectAttempts: 999,
+	})
+	tr.BaseTransport.Start()
+	defer tr.Stop()
+
+	// The first solved jar spends the cut budget. Everything after it, however much the jar
+	// churns, must leave a long cooldown alone.
+	tr.ProvideCookies("a=1; solved=1")
+
+	returned := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		tr.scheduleReconnectWithMinDelay(0, reasonCaptchaBlocked, errors.New("captcha"), time.Hour)
+		returned <- time.Since(start)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	for i := 0; i < 40; i++ {
+		tr.ProvideCookies(fmt.Sprintf("a=1; nonce=%d", i))
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	select {
+	case took := <-returned:
+		t.Errorf("wait ended after %v - churning cookie pushes cut the cooldown short repeatedly", took)
+	case <-time.After(600 * time.Millisecond):
+	}
+	tr.Stop()
+}
+
+func TestCaptchaCooldownIsCutShortByFirstNewCookieJar(t *testing.T) {
+	// A genuinely solved captcha must take effect at once, not after the full cooldown.
+	const minDelay = time.Hour
+
+	tr := NewYandexDocsTransport("http://unused.invalid", transport.TransportConfig{
+		ReconnectDelay:       time.Millisecond,
+		ReconnectMultiplier:  1,
+		MaxReconnectAttempts: 999,
+	})
+	tr.BaseTransport.Start()
+	defer tr.Stop()
+
+	var once sync.Once
+	tr.SetEventCallback(func(code, detail string) {
+		if code == transport.EventRetrying {
+			once.Do(func() { tr.Stop() })
+		}
+	})
+
+	returned := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		tr.scheduleReconnectWithMinDelay(0, reasonCaptchaBlocked, errors.New("captcha"), minDelay)
+		returned <- time.Since(start)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	tr.ProvideCookies("a=1; solved=1")
+
+	select {
+	case took := <-returned:
+		if took > 3*time.Second {
+			t.Errorf("waited %v after a solved jar arrived, want it applied promptly", took)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a solved cookie jar did not cut the cooldown short")
+	}
+}
+
+func TestCookieCutBudgetReturnsAfterCooldownElapses(t *testing.T) {
+	// After a cooldown actually elapses the next solve must be able to apply again, so one
+	// cut does not permanently disable the push path.
+	tr := NewYandexDocsTransport("http://unused.invalid", transport.TransportConfig{
+		ReconnectDelay:       time.Millisecond,
+		ReconnectMultiplier:  1,
+		MaxReconnectAttempts: 999,
+	})
+	tr.BaseTransport.Start()
+	defer tr.Stop()
+
+	var once sync.Once
+	tr.SetEventCallback(func(code, detail string) {
+		if code == transport.EventRetrying {
+			once.Do(func() { tr.Stop() })
+		}
+	})
+
+	// A cooldown that runs its course is what earns the next cut budget.
+	first := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		tr.scheduleReconnectWithMinDelay(0, reasonCaptchaBlocked, errors.New("captcha"), 150*time.Millisecond)
+		first <- time.Since(start)
+	}()
+	if took := <-first; took < 150*time.Millisecond {
+		t.Fatalf("first cooldown took %v, want it to run its full course", took)
+	}
+
+	tr.BaseTransport.Start()
+	second := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		tr.scheduleReconnectWithMinDelay(0, reasonCaptchaBlocked, errors.New("captcha"), time.Hour)
+		second <- time.Since(start)
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	tr.ProvideCookies("a=1; solved=2")
+	select {
+	case took := <-second:
+		if took > 3*time.Second {
+			t.Errorf("second wait took %v, want the next solved jar to apply promptly", took)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a second solved jar never applied - the cut budget never reset")
 	}
 }
 

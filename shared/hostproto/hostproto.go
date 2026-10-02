@@ -30,6 +30,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -63,7 +64,8 @@ func readConfigForEntry(path string) string {
 
 // parseConfig — разбор KEY=VALUE-текста (# = комментарий). Формат ЕДИН на обеих платформах и для
 // обеих форм доставки: LISTEN_PORT / SOCKS_USER / SOCKS_PASS / LINK / DNS_SERVERS / APP_LANG /
-// START_REASON / MODULE_STATE / SETTING_<key> — их пишет и Android ModuleManager, и Desktop-хост.
+// START_REASON / MODULE_STATE / HOST_FEATURES / SETTING_<key> — их пишет и Android ModuleManager, и
+// Desktop-хост.
 func parseConfig(content string) map[string]string {
 	out := map[string]string{}
 	for _, line := range strings.Split(content, "\n") {
@@ -81,6 +83,8 @@ func parseConfig(content string) map[string]string {
 	// Здесь, а не у вызывающего: это ЕДИНСТВЕННАЯ дверь, через которую конфиг хоста входит в
 	// процесс, — её проходят и desktop-argv, и android-C-ABI.
 	rememberHostDNSServers(out["DNS_SERVERS"])
+	// Возможности хоста — тем же приёмом: трактовка ключа, который пишет ХОСТ, принадлежит канону.
+	rememberHostFeatures(out["HOST_FEATURES"])
 	return out
 }
 
@@ -359,16 +363,120 @@ func runAction(profileDir, id string, payload map[string]any) (string, bool) {
 	return s, false // не-base64 — отдаём как есть (агностично)
 }
 
+// actionResultEnvelope разворачивает КОНВЕРТ ответа действия. Хост отдаёт результат любого типа
+// объектом `{"type":"<тип>", …}`: `{"value":…}` у `webview`, `{"values":{…}}` у `form`, `{"id":…}`
+// у `choice`, `{"ok":true}` у `confirm`/`display`. Ответ, который конвертом не является (голая
+// строка от escape-hatch со своей страницей), даёт `nil` — это не ошибка, а вторая законная форма.
+//
+// ⛔ Знание о конверте живёт ЗДЕСЬ, а не у каждого модуля. Модуль, разбирающий ответ сам, получает
+// «значения нет» вместо значения — и это не теория: 19.09 `{"value":"<токен>","type":"webview"}`
+// читался модулем как пустой токен, вход в VK шёл по кругу без единого сообщения о причине.
+func actionResultEnvelope(res string) map[string]any {
+	var obj map[string]any
+	if json.Unmarshal([]byte(strings.TrimSpace(res)), &obj) != nil {
+		return nil
+	}
+	return obj
+}
+
+// actionResultString — СКАЛЯРНОЕ поле конверта (`value` у `webview`, `id` у `choice`). Ответ без
+// конверта отдаётся как есть: там голая строка и есть значение. Конверт без запрошенного поля —
+// пусто: поле не пришло, и догадываться, какое из остальных имелось в виду, нельзя.
+func actionResultString(res, key string) string {
+	env := actionResultEnvelope(res)
+	if env == nil {
+		return strings.TrimSpace(res)
+	}
+	if v, ok := env[key]; ok && v != nil {
+		return strings.TrimSpace(fmt.Sprint(v))
+	}
+	return ""
+}
+
+// actionResultCookies — cookie из ответа `webview`-действия, попросившего их (`collectCookies`,
+// MODULE_API §2.7): адрес → заголовок `Cookie` ("a=1; b=2"). nil — cookie не приходили (правило их не
+// просило или хост поля не знает — см. hostSupports("webview.cookies")).
+func actionResultCookies(res string) map[string]string {
+	env := actionResultEnvelope(res)
+	raw, ok := env["cookies"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	out := make(map[string]string, len(raw))
+	for u, v := range raw {
+		if s, ok := v.(string); ok {
+			out[u] = s
+		}
+	}
+	return out
+}
+
+// actionResultCookieJar — все cookie ответа одной картой имя → значение (для клиента, которому адрес
+// не важен). Одноимённые с разных адресов: побеждает встретившийся позже в порядке адресов по
+// алфавиту — детерминированно, но если домен важен, бери actionResultCookies.
+func actionResultCookieJar(res string) map[string]string {
+	byURL := actionResultCookies(res)
+	if byURL == nil {
+		return nil
+	}
+	urls := make([]string, 0, len(byURL))
+	for u := range byURL {
+		urls = append(urls, u)
+	}
+	sort.Strings(urls)
+	jar := map[string]string{}
+	for _, u := range urls {
+		for _, part := range strings.Split(byURL[u], ";") {
+			name, value, ok := strings.Cut(strings.TrimSpace(part), "=")
+			if ok && name != "" {
+				jar[name] = value
+			}
+		}
+	}
+	return jar
+}
+
+// ── Возможности хоста (MODULE_API §2.7 «Что умеет хост») ──────────────────────────────────────
+
+var (
+	hostFeaturesMu sync.Mutex
+	hostFeatures   = map[string]bool{}
+)
+
+// rememberHostFeatures — `HOST_FEATURES=` конфига (зовёт parseConfig).
+func rememberHostFeatures(csv string) {
+	hostFeaturesMu.Lock()
+	defer hostFeaturesMu.Unlock()
+	hostFeatures = map[string]bool{}
+	for _, f := range strings.Split(csv, ",") {
+		if f = strings.TrimSpace(f); f != "" {
+			hostFeatures[f] = true
+		}
+	}
+}
+
+// hostSupports — исполняет ли хост необязательную возможность контракта (`webview.cookies`,
+// `webview.leavePattern`, …). Хост, который её не знает, поле правила молча пропустит: окно, ждущее
+// `leavePattern`, не завершится само, ответ придёт без cookie. Решать надо ДО отправки правила.
+func hostSupports(feature string) bool {
+	hostFeaturesMu.Lock()
+	defer hostFeaturesMu.Unlock()
+	return hostFeatures[feature]
+}
+
 // emitActionClose — ACTION_CLOSE|<id>: закрыть окно действия САМОМУ, не дожидаясь клика. Ради этого
 // и существует тип `display` отдельно от `confirm` (device-code, push-подтверждение).
 func emitActionClose(id string) {
 	emitMarker("ACTION_CLOSE", id)
 }
 
-// actionDeadline — потолок ожидания результата. Совпадает с hard-cap'ом хоста (~5 мин): ждать
-// дольше бессмысленно (хост уже прислал бы "CANCELLED"), ждать меньше — отнимать у юзера время на
-// капчу/логин.
-const actionDeadline = 5 * time.Minute
+// actionDeadline — потолок ожидания результата: страховка на хост, который не ответил вовсе.
+// ⛔ ДОЛЬШЕ hard-cap'а хоста (5 мин), а не равен ему. Часы модуля идут с `ACTION_REQUIRED`, часы
+// хоста — с приёма этой строки (stdout он читает с опозданием), то есть позже; при равных потолках
+// модуль истекал бы первым и выходил, а хост видел бы умерший helper без отказа — «не поднялся» и
+// `-2` серверу за неотвеченное окно. Ответ хоста "CANCELLED" по hard-cap'у обязан приходить
+// раньше: это отказ человека, а не вердикт о сервере. Минута запаса покрывает опоздание чтения.
+const actionDeadline = 6 * time.Minute
 
 // awaitActionResult — ждёт результат по каналу ИЛИ по файлу, что придёт первым. Второй возврат —
 // «ждать больше нечего»: истёк дедлайн ЛИБО отменён ctx. Результат приходит КАНАЛОМ (он такой же

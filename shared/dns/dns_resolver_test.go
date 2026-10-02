@@ -14,6 +14,7 @@ import (
 	"errors"
 	"net"
 	"testing"
+	"time"
 )
 
 // TestLookupHostNeverFallsBackToDefaultResolver — ловушка на `net.DefaultResolver`.
@@ -91,5 +92,32 @@ func TestSetServersKeepsPreviousOnEmpty(t *testing.T) {
 	after := r.currentServers()
 	if len(after) != len(before) {
 		t.Fatalf("пустой список затёр рабочие серверы: было %v, стало %v", before, after)
+	}
+}
+
+// TestSetServersKeepsAddressesAsFallback — смена сети НЕ выбрасывает уже известные адреса.
+//
+// Смена сети делает записи недоверенными, и следующий резолв обязан идти в сеть — это проверяется
+// просроченностью. Но выбросить их совсем значит отнять у модуля последнее рабочее знание ровно
+// тогда, когда сеть наименее надёжна: новые резолверы могут ещё не отвечать, и тогда транспорт не
+// поднимется вовсе. Здесь проверяется оба свойства сразу: запись пережила смену списка И отдаётся
+// только при провале резолва.
+func TestSetServersKeepsAddressesAsFallback(t *testing.T) {
+	r := newProtectedResolver("192.0.2.1", "")
+	r.cache["turn.example"] = dnsCacheEntry{
+		ips:     []string{"203.0.113.7"},
+		expires: time.Now().Add(dnsCacheTTL),
+	}
+
+	r.SetServers([]string{"198.51.100.5"})
+
+	// Свежесть запись потеряла: без неё быстрый путь обязан промахнуться и пойти в сеть.
+	if _, ok := r.cachedLocked("turn.example", false); ok {
+		t.Fatal("после смены сети запись осталась свежей — резолв не пойдёт в сеть")
+	}
+	// А как запас она на месте: именно это спасает транспорт, когда новые резолверы молчат.
+	got, ok := r.cachedLocked("turn.example", true)
+	if !ok || len(got) != 1 || got[0] != "203.0.113.7" {
+		t.Fatalf("известный адрес выброшен вместе со сменой сети: %v (ok=%v)", got, ok)
 	}
 }

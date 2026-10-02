@@ -56,6 +56,9 @@ const (
 type dnsCacheEntry struct {
 	ips     []string
 	expires time.Time
+	// stale — запись получена через ПРЕЖНЮЮ сеть: свежей её считать нельзя, но и выбрасывать
+	// нечем. Читается только когда резолв провалился (@see LookupHost).
+	stale bool
 }
 
 type protectedResolver struct {
@@ -95,7 +98,7 @@ func newProtectedResolver(dnsServersCsv, protectPath string) *protectedResolver 
 // точка) прежние резолверы в новой сети недостижимы: запрос уходит и не возвращается, `LookupHost`
 // отдаёт таймаут чтения, а SOCKS5 CONNECT — `0x04 host unreachable`. Транспорт модуля при этом
 // ЖИВ, поэтому ни его переподключение, ни `ForceReconnect` не лечат — помогает только новый
-// список. Замер на устройстве 2026-09-17: процесс прожил ~12 часов через несколько смен сети, все
+// список. Замер на устройстве: процесс прожил ~12 часов через несколько смен сети, все
 // резолвы били в DNS ПЕРВОЙ сети и падали по таймауту (`dns: read 8.8.4.4:53 … i/o timeout`),
 // связь возвращал только ручной перезапуск модуля, который и переподставлял `DNS_SERVERS`.
 //
@@ -123,8 +126,35 @@ func (r *protectedResolver) SetServers(servers []string) {
 	}
 	r.mu.Lock()
 	r.servers = normalized
-	r.cache = map[string]dnsCacheEntry{}
+	// ⛔ ЗАПИСИ НЕ ВЫБРАСЫВАЮТСЯ, а помечаются устаревшими. Смена сети делает их недоверенными
+	// (адрес мог быть split-horizon прежней сети), поэтому следующий резолв обязан идти в сеть —
+	// это `stale` и обеспечивает, просрочивая запись. Но выбросить их насовсем значит отнять у
+	// модуля последнее рабочее знание ровно в тот момент, когда сеть наименее надёжна: новые
+	// резолверы ещё могут не отвечать, и тогда модулю нечем поднять транспорт вовсе — хотя
+	// прежние адреса с большой вероятностью живы. Поэтому они остаются аварийным запасом и
+	// отдаются ТОЛЬКО при провале резолва (@see LookupHost).
+	for host, e := range r.cache {
+		e.stale = true
+		e.expires = time.Time{}
+		r.cache[host] = e
+	}
 	r.mu.Unlock()
+}
+
+// cachedLocked — ЕДИНСТВЕННОЕ чтение кэша (лок держит вызывающий). `allowStale` решает, годится
+// ли запись, пережившая смену сети: свежесть спрашивают все, запас — только тот, кто уже получил
+// отказ от сети. Отдельной функцией, потому что читателей три (быстрый путь, ожидающий чужого
+// резолва и сам резолвер на провале), и разойтись им нельзя: исход на одно событие обязан быть
+// одинаковым у всех.
+func (r *protectedResolver) cachedLocked(host string, allowStale bool) ([]string, bool) {
+	e, ok := r.cache[host]
+	if !ok || len(e.ips) == 0 {
+		return nil, false
+	}
+	if time.Now().Before(e.expires) {
+		return e.ips, true
+	}
+	return e.ips, allowStale
 }
 
 // currentServers — снимок списка под локом. Сам слайс НИКОГДА не правится на месте (только
@@ -164,9 +194,9 @@ func (r *protectedResolver) LookupHost(host string) ([]string, error) {
 	}
 
 	r.mu.Lock()
-	if e, ok := r.cache[host]; ok && time.Now().Before(e.expires) {
+	if ips, ok := r.cachedLocked(host, false); ok {
 		r.mu.Unlock()
-		return e.ips, nil
+		return ips, nil
 	}
 	if ch, ok := r.inFlight[host]; ok {
 		// Резолв ЭТОГО хоста уже идёт на другой горутине — ждём его результат вместо дублирования
@@ -174,10 +204,12 @@ func (r *protectedResolver) LookupHost(host string) ([]string, error) {
 		r.mu.Unlock()
 		<-ch
 		r.mu.Lock()
-		e, ok := r.cache[host]
+		// Запас принимается и здесь: исход у ждущего обязан быть тот же, что у владельца резолва,
+		// иначе половина вызывающих получает адрес, а половина — отказ на одном и том же событии.
+		ips, ok := r.cachedLocked(host, true)
 		r.mu.Unlock()
-		if ok && time.Now().Before(e.expires) {
-			return e.ips, nil
+		if ok {
+			return ips, nil
 		}
 		return nil, fmt.Errorf("dns: concurrent resolve of %s failed", host)
 	}
@@ -191,6 +223,18 @@ func (r *protectedResolver) LookupHost(host string) ([]string, error) {
 	delete(r.inFlight, host)
 	if err == nil {
 		r.cache[host] = dnsCacheEntry{ips: ips, expires: time.Now().Add(dnsCacheTTL)}
+	} else if stale, ok := r.cachedLocked(host, true); ok {
+		// ⛔ РЕЗОЛВ ПРОВАЛИЛСЯ, А АДРЕС У НАС ЕСТЬ — отдаём его вместо отказа. Это единственное
+		// место, где просроченная запись имеет право уйти наружу, и условие тут жёсткое: сеть
+		// ответа не дала. Свежесть запись при этом НЕ получает (`expires` не двигаем): следующий
+		// вызов снова пойдёт в сеть, то есть это аварийный запас, а не продление жизни кэша.
+		//
+		// Зачем: сразу после смены сети резолверы нередко ещё не отвечают, а прежние адреса живы
+		// — отказ в этот момент оставляет модуль вовсе без транспорта, и сам он из этого уже не
+		// выбирается (живой разбор: csqtt после перехода сота→Wi-Fi не поднял ни одного
+		// TURN-воркера и полторы минуты отвечал `code=4`).
+		ips = stale
+		err = nil
 	}
 	r.mu.Unlock()
 	close(ch)

@@ -7,67 +7,54 @@ import (
 	"universal-bypass-tool/transport"
 )
 
-// TestPeerSilenceDetector pins the AntiNet divergence that covers the incident of
-// 2026-09-17 15:08-15:16: the WebSocket to Yandex stayed healthy (its read deadline
-// is fed by Yandex's own Socket.IO pings) while the exit-node sharing the document
-// had stopped answering, so the tunnel carried nothing for eight minutes and three
-// host nudges in a row could not fix it.
-//
-// Deployment can only show that the detector leaves a HEALTHY session alone - making
-// a third-party exit-node go silent on demand is not something a test can arrange.
-// So the state machine itself is pinned here: silence is declared only after
-// peerSilenceFactor missed keep-alives, and any word from the peer clears it.
-func TestPeerSilenceDetector(t *testing.T) {
-	cfg := transport.DefaultConfig()
-	cfg.KeepAliveInterval = 20 * time.Millisecond
-	window := cfg.KeepAliveInterval * peerSilenceFactor
+func TestPeerSilent(t *testing.T) {
+	t.Run("no frame heard yet is not silence", func(t *testing.T) {
+		tr := &YandexDocsTransport{}
+		if tr.peerSilent() {
+			t.Fatal("session that has not heard a single frame must not count as silent")
+		}
+	})
 
-	tr := NewYandexDocsTransport("https://docs.yandex.ru/docs/view?url=test", cfg)
+	t.Run("keep-alive disabled has no verdict", func(t *testing.T) {
+		tr := &YandexDocsTransport{}
+		cfg := transport.DefaultConfig()
+		cfg.KeepAliveInterval = 0
+		tr.BaseTransport = transport.NewBaseTransport(cfg)
+		tr.notePeerMsg()
+		time.Sleep(10 * time.Millisecond)
+		if tr.peerSilent() {
+			t.Fatal("with keep-alive disabled there is no basis to judge, verdict must be not-silent")
+		}
+	})
 
-	// Nothing heard yet - the session is still coming up, so there is no basis to
-	// judge it. Declaring silence here would kill every connection at birth.
-	if tr.peerSilent() {
-		t.Fatal("a session that has heard nothing yet must not count as silent")
-	}
+	t.Run("fresh frame, then silence past the window", func(t *testing.T) {
+		tr := &YandexDocsTransport{}
+		cfg := transport.DefaultConfig()
+		cfg.KeepAliveInterval = 20 * time.Millisecond
+		tr.BaseTransport = transport.NewBaseTransport(cfg)
 
-	tr.notePeerAlive()
-	if tr.peerSilent() {
-		t.Fatal("a peer heard from just now must not count as silent")
-	}
+		tr.notePeerMsg()
+		if tr.peerSilent() {
+			t.Fatal("frame just arrived: peer is alive")
+		}
 
-	// Still inside the window: a single missed keep-alive is jitter, not silence.
-	time.Sleep(window / 2)
-	if tr.peerSilent() {
-		t.Fatalf("peer must not be declared silent inside the %v window", window)
-	}
+		// The exact window boundary is deliberately not asserted: time.Sleep always
+		// overshoots, so a check sitting precisely on the edge would be flaky for no
+		// reason. Assert well inside the window, then well past it.
+		time.Sleep(cfg.KeepAliveInterval * peerSilenceFactor / 2)
+		if tr.peerSilent() {
+			t.Fatal("half a window of silence still counts as alive")
+		}
 
-	// Past the window with nothing from the peer - this is the 15:10 state, and it
-	// is what the old code could not see at all.
-	time.Sleep(window)
-	if !tr.peerSilent() {
-		t.Fatalf("peer silent for more than %v must be detected", window)
-	}
+		time.Sleep(cfg.KeepAliveInterval * peerSilenceFactor)
+		if !tr.peerSilent() {
+			t.Fatal("past the silence window the peer must count as gone")
+		}
 
-	// One word from the peer clears it: the session is usable again and must not be
-	// torn down.
-	tr.notePeerAlive()
-	if tr.peerSilent() {
-		t.Fatal("a message from the peer must clear the silence")
-	}
-}
-
-// TestPeerSilenceDisabledWithoutKeepAlive guards the escape hatch: with keep-alive
-// switched off there is no interval to count missed beats against, so the detector
-// must stay quiet rather than tear sessions down on an invented schedule.
-func TestPeerSilenceDisabledWithoutKeepAlive(t *testing.T) {
-	cfg := transport.DefaultConfig()
-	cfg.KeepAliveInterval = 0
-
-	tr := NewYandexDocsTransport("https://docs.yandex.ru/docs/view?url=test", cfg)
-	tr.notePeerAlive()
-	time.Sleep(10 * time.Millisecond)
-
-	if tr.peerSilent() {
-		t.Fatal("with keep-alive disabled the detector must never fire")
-	}
+		// Any frame from the peer revives the session again.
+		tr.notePeerMsg()
+		if tr.peerSilent() {
+			t.Fatal("a frame from the peer must clear the silence")
+		}
+	})
 }

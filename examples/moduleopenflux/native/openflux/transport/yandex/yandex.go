@@ -2,6 +2,7 @@ package yandex
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -12,8 +13,10 @@ import (
 	"math"
 	"math/rand"
 	"net/http"
+	"net/http/cookiejar"
 	neturl "net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -68,6 +71,10 @@ var errCaptchaBlocked = errors.New("captcha or bot-check page returned instead o
 // captchaCooldown is a floor under the usual attempt-scaled backoff for captcha failures.
 const captchaCooldown = 3 * time.Minute
 
+// cookieRetryFloor applies when a fresh jar arrives mid-fetch: worth retrying promptly, but
+// never with a zero wait, or a client re-pushing the same unsolved jar spins the transport.
+const cookieRetryFloor = 5 * time.Second
+
 type YandexDocsInfo struct {
 	CookieStr   string
 	Token       string
@@ -115,6 +122,10 @@ type YandexDocsTransport struct {
 
 	peerBatches atomic.Bool
 
+	// ⚠️ ANTI-NET DIVERGENCE (не из openflux-server): момент последнего кадра ОТ ПИРА.
+	// Поле нужно для peerSilent() — см. peer_silence.go. Не удалять при переносе апстрима.
+	lastPeerMsgAtNano atomic.Int64
+
 	// peerZstdBatches is peerBatches' counterpart for zstdBatchMarker.
 	peerZstdBatches atomic.Bool
 
@@ -130,63 +141,28 @@ type YandexDocsTransport struct {
 
 	wakeReconnect chan struct{}
 
-	// lastPeerMsgAtNano is when the PEER (the exit node sharing this document) was last heard from - see peerSilent for why the read deadline does not cover this. AntiNet divergence from openflux-server.
-	lastPeerMsgAtNano atomic.Int64
-
 	// tag identifies this instance's log lines on a node running many keys at once - a bare "[YDOCS]" line can't otherwise be traced back to which key it belongs to.
 	tag string
 
 	// providedCookies is set via ProvideCookies and resent on every future fetch.
-	providedCookies string
+	providedCookies         string
+	cookieCutPending        bool
+	captchaCookieGeneration atomic.Uint64
 
 	captchaSolveMode CaptchaSolveMode
-}
-
-// peerSilenceFactor is how many of the peer's own keep-alives may be missed before the session counts as dead: both ends emit "---KA---" on the same KeepAliveInterval, so a healthy peer is heard from every interval even with zero tunnel traffic, and four misses is silence rather than jitter.
-const peerSilenceFactor = 4
-
-// notePeerAlive records that something genuinely originating FROM THE PEER arrived, called from the two handleMessage branches that carry peer traffic - its keep-alive, and payload that survived the self-echo check. Socket.IO's own "2"/"3" heartbeat is deliberately NOT counted: that comes from Yandex, not from the peer, and counting it is exactly what made the connection look alive while the exit node was gone.
-func (t *YandexDocsTransport) notePeerAlive() {
-	t.lastPeerMsgAtNano.Store(time.Now().UnixNano())
-}
-
-// peerSilent reports that the WebSocket is still fine but the peer behind the document has stopped answering.
-//
-// ⛔ WHY THE READ DEADLINE DOES NOT CATCH THIS: connectToDoc arms SetReadDeadline(readTimeout) before every ReadMessage, but the deadline is fed by ANY inbound frame, and Yandex keeps sending its own Socket.IO pings regardless of whether the other participant is still there, so the socket stays "healthy" while nothing from the exit node arrives at all.
-//
-// Measured on the device 2026-09-17 15:08:46-15:16: only "[YDOCS] ->" lines in that window, no inbound, no "Keep-alive failed" (the write side kept succeeding) - and three host nudges in a row could not fix it, because ForceReconnect dropped the session and redialled straight back to the same silent peer. The tunnel returned by itself ~8 minutes later.
-func (t *YandexDocsTransport) peerSilent() bool {
-	last := t.lastPeerMsgAtNano.Load()
-	if last == 0 {
-		return false // nothing heard yet: the session is still coming up
-	}
-	window := t.GetConfig().KeepAliveInterval * peerSilenceFactor
-	if window <= 0 {
-		return false // keep-alive disabled by config → no basis to judge
-	}
-	return time.Since(time.Unix(0, last)) > window
 }
 
 // CaptchaSolveMode selects how an exit node reacts to a CAPTCHA failure - exit-node use only.
 type CaptchaSolveMode string
 
 const (
-	CaptchaSolveModeOff             CaptchaSolveMode = ""
-	CaptchaSolveModeHeadlessBrowser CaptchaSolveMode = "headless_browser"
+	CaptchaSolveModeOff      CaptchaSolveMode = ""
+	CaptchaSolveModeNative   CaptchaSolveMode = "native"
+	CaptchaSolveModeExternal CaptchaSolveMode = "external"
 )
 
 func (t *YandexDocsTransport) SetCaptchaSolveMode(mode CaptchaSolveMode) {
 	t.captchaSolveMode = mode
-}
-
-func (t *YandexDocsTransport) tryHeadlessSolve(docURL string) {
-	cookies, err := SolveCaptcha(docURL)
-	if err != nil {
-		t.debugf("headless captcha solve failed, falling back to the normal cooldown: %v", err)
-		return
-	}
-	t.debugf("headless captcha solve succeeded, forcing a reconnect")
-	t.ProvideCookies(cookies)
 }
 
 func (t *YandexDocsTransport) debugf(format string, args ...interface{}) {
@@ -195,17 +171,139 @@ func (t *YandexDocsTransport) debugf(format string, args ...interface{}) {
 
 // ProvideCookies feeds a solved session's cookies into subsequent fetches and forces a reconnect.
 func (t *YandexDocsTransport) ProvideCookies(cookieStr string) {
+	normalized := normalizeCookieHeader(cookieStr)
+
 	t.Mu.Lock()
-	t.providedCookies = cookieStr
+	if normalized == t.providedCookies {
+		t.Mu.Unlock()
+		t.debugf("ignoring repeated push of the same %d cookie bytes", len(cookieStr))
+		return
+	}
+	t.providedCookies = normalized
 	t.Mu.Unlock()
+
+	sum := sha256.Sum256([]byte(normalized))
+	t.debugf("pushed cookie jar: %d bytes, sha256 %x", len(normalized), sum[:6])
+
+	t.captchaCookieGeneration.Add(1)
+	// The client re-solves on every poll and its jar churns between attempts, so cutting the
+	// wait short every time turns one solved captcha into a hot loop. One push may cut the wait
+	// per retry episode; the rest are stored and picked up by the next scheduled attempt.
+	t.Mu.Lock()
+	cut := !t.cookieCutPending
+	if cut {
+		t.cookieCutPending = true
+	}
+	t.Mu.Unlock()
+
+	if !cut {
+		t.debugf("new %d byte cookie jar, applying it on the next retry window", len(cookieStr))
+		return
+	}
 	t.debugf("received %d bytes of externally-solved cookies, forcing a reconnect", len(cookieStr))
 	t.ForceReconnect()
+}
+
+// cookieNames lists only the names of the cookies a jar would send for a URL: enough to tell
+// "the jar arrived" from "the jar arrived but is missing the session cookie" without logging
+// secret values.
+func cookieNames(cookies []*http.Cookie) string {
+	if len(cookies) == 0 {
+		return "(none)"
+	}
+	names := make([]string, 0, len(cookies))
+	for _, c := range cookies {
+		names = append(names, c.Name)
+	}
+	return strings.Join(names, ",")
+}
+
+func shortURL(u string) string {
+	if len(u) > 90 {
+		return u[:90] + "..."
+	}
+	return u
+}
+
+func pageTitle(body []byte) string {
+	m := regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`).FindSubmatch(body)
+	if m == nil {
+		return ""
+	}
+	return strings.TrimSpace(string(m[1]))
+}
+
+// normalizeCookieHeader sorts the pairs so the same jar in a different order compares equal.
+// The WebView rebuilds the header from a map, so its order changes on every poll and a plain
+// string comparison would treat a re-push of the identical jar as new credentials.
+func normalizeCookieHeader(header string) string {
+	parts := strings.Split(header, ";")
+	cleaned := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			cleaned = append(cleaned, p)
+		}
+	}
+	sort.Strings(cleaned)
+	return strings.Join(cleaned, "; ")
+}
+
+// solveCaptchaIsolated keeps the proof-of-work solver off the live jar. The solver's own
+// Set-Cookie responses otherwise overwrite an externally-solved session, so a good jar
+// stops working after the first captcha attempt and the client re-pushes it forever.
+func solveCaptchaIsolated(docURL string, jar http.CookieJar, userAgent string, rt http.RoundTripper) error {
+	temp, err := cookiejar.New(nil)
+	if err != nil {
+		return err
+	}
+	parsed, err := neturl.Parse(docURL)
+	if err != nil {
+		return err
+	}
+	temp.SetCookies(parsed, jar.Cookies(parsed))
+	acceptedURL, err := solveCaptcha(docURL, temp, userAgent, rt)
+	if err != nil {
+		return err
+	}
+	jar.SetCookies(parsed, temp.Cookies(parsed))
+	if accepted, perr := neturl.Parse(acceptedURL); perr == nil && accepted.Host != parsed.Host {
+		jar.SetCookies(accepted, temp.Cookies(accepted))
+	}
+	return nil
 }
 
 func (t *YandexDocsTransport) getProvidedCookies() string {
 	t.Mu.RLock()
 	defer t.Mu.RUnlock()
 	return t.providedCookies
+}
+
+func parseCookieHeader(header string) []*http.Cookie {
+	req := &http.Request{Header: http.Header{"Cookie": {header}}}
+	return req.Cookies()
+}
+
+func mergeCookieHeaders(fresh, provided string) string {
+	values := make(map[string]string)
+	order := make([]string, 0)
+	add := func(header string, override bool) {
+		for _, c := range parseCookieHeader(header) {
+			if _, ok := values[c.Name]; !ok {
+				order = append(order, c.Name)
+			}
+			if override || values[c.Name] == "" {
+				values[c.Name] = c.Value
+			}
+		}
+	}
+	add(fresh, false)
+	add(provided, true)
+	parts := make([]string, 0, len(order))
+	for _, name := range order {
+		parts = append(parts, name+"="+values[name])
+	}
+	return strings.Join(parts, "; ")
 }
 
 // EnableSelfCompression makes writerLoop zstd-compress a whole batch of raw packets once the peer's keepalive proves it understands zstdBatchMarker, beating per-packet LZ4's missed cross-packet redundancy; not for use alongside external CompressedTransport wrapping.
@@ -287,8 +385,10 @@ func (t *YandexDocsTransport) Send(data []byte) error {
 		return fmt.Errorf("no active session")
 	}
 
+	packet := make([]byte, len(data))
+	copy(packet, data)
 	select {
-	case session.WriteQueue <- data:
+	case session.WriteQueue <- packet:
 		t.RecordSend(len(data))
 		return nil
 	default:
@@ -319,12 +419,15 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 			userID = t.baseUserID + suffix
 		}
 
+		cookieGeneration := t.captchaCookieGeneration.Load()
 		info, err := t.fetchDocInfo(t.url, userID)
 		if err != nil {
 			t.debugf("fetchDocInfo failed: %v", err)
 			if errors.Is(err, errCaptchaBlocked) {
-				if t.captchaSolveMode == CaptchaSolveModeHeadlessBrowser {
-					go t.tryHeadlessSolve(t.url)
+				if t.captchaCookieGeneration.Load() != cookieGeneration {
+					t.debugf("captcha cookies changed during fetch, retrying soon")
+					t.scheduleReconnectWithMinDelay(attempt, reasonCaptchaBlocked, err, cookieRetryFloor)
+					return
 				}
 				t.scheduleReconnectWithMinDelay(attempt, reasonCaptchaBlocked, err, captchaCooldown)
 			} else {
@@ -413,12 +516,13 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		t.SetConnected(true)
 		t.EmitEvent(transport.EventConnected, strconv.Itoa(attempt+1))
 		connectedAt := time.Now()
-		// Start the peer-silence clock from the moment the session is up, so a fresh connection is not judged by whatever the previous one left behind.
-		t.notePeerAlive()
 
 		for t.IsRunning() {
 			conn.SetReadDeadline(time.Now().Add(readTimeout))
 			_, message, err := conn.ReadMessage()
+			if err == nil {
+				t.notePeerMsg()
+			}
 			if err != nil {
 				t.debugf("Read error: %v", err)
 				t.SetConnected(false)
@@ -706,11 +810,10 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 				t.SetConnected(false)
 				session.Conn.Close()
 			} else if t.peerSilent() {
-				// AntiNet divergence from openflux-server: the write side is fine and Yandex still answers, but nothing has come from the peer for peerSilenceFactor keep-alives, so the exit node is gone from the document and this session will never carry traffic again on its own - same teardown as a failed write, so the read loop redials.
-				//
-				// Checked HERE rather than in the read loop for the same reason the write failure is: this ticker is the only thing that runs on a schedule while ReadMessage sits blocked, so it is what can notice an ABSENCE. The read loop only ever reacts to bytes that arrive, and the whole point is that none do.
-				utils.Debugf("[YDOCS] peer silent for %v — dropping session to re-dial",
-					t.GetConfig().KeepAliveInterval*peerSilenceFactor)
+				// ⚠️ ANTI-NET DIVERGENCE: пир молчит, писать по-прежнему выходит, но exit-узел
+				// исчез из документа и эта сессия уже не понесёт трафик. Рвём её так же, как
+				// неудачную запись, чтобы read loop перезвонил. Логика — в peer_silence.go.
+				utils.Debugf("[YDOCS] peer silent — dropping session to re-dial")
 				t.SetConnected(false)
 				session.Conn.Close()
 			}
@@ -731,8 +834,6 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 		if strings.Contains(text, kaEncSelfCompressToken) {
 			t.peerEncSelfCompress.Store(true)
 		}
-		// The peer's own keep-alive: with an idle tunnel this is the ONLY proof it is still on the other end of the document.
-		t.notePeerAlive()
 		return
 	}
 
@@ -769,8 +870,6 @@ func (t *YandexDocsTransport) handleMessage(session *DocSession, data []byte) {
 			t.debugf("<- %d bytes\n", len(decoded))
 		}
 
-		// Payload that survived wasRecentlySent above is genuinely the peer's.
-		t.notePeerAlive()
 		t.RecordReceive(len(decoded))
 
 		if t.encrypted {
@@ -906,20 +1005,29 @@ func (t *YandexDocsTransport) scheduleReconnectWithMinDelay(attempt int, reasonC
 	causeText := strings.ReplaceAll(cause.Error(), "\n", " ")
 	t.EmitEvent(transport.EventRetrying, fmt.Sprintf("%d|%d|%s|%s", attempt+1, int(delay.Seconds()), reasonCode, causeText))
 	if delay > 0 {
+		// A changed jar must take effect promptly, so the wait stays interruptible. Repeated
+		// pushes of the same jar never reach here: ProvideCookies ignores an unchanged one.
 		wake := make(chan struct{})
 		t.Mu.Lock()
 		t.wakeReconnect = wake
 		t.Mu.Unlock()
 
+		cutShort := false
 		select {
 		case <-time.After(delay):
 		case <-wake:
+			cutShort = true
 			t.debugf("backoff wait cut short by ForceReconnect")
 		}
 
 		t.Mu.Lock()
 		if t.wakeReconnect == wake {
 			t.wakeReconnect = nil
+		}
+		// Only a cooldown that actually elapsed earns the next cookie-driven cut, otherwise a
+		// cut would clear its own budget and the client could drive one retry per push again.
+		if !cutShort {
+			t.cookieCutPending = false
 		}
 		t.Mu.Unlock()
 	}
@@ -970,30 +1078,121 @@ func (t *YandexDocsTransport) backoffDelay(attempt int) time.Duration {
 }
 
 func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, error) {
+	jar, _ := cookiejar.New(nil)
+	if parsed, err := neturl.Parse(url); err == nil {
+		if provided := t.getProvidedCookies(); provided != "" {
+			// Without an explicit root path the jar scopes every cookie to the directory of the
+			// requested URL. A /i/ share link then sends the whole jar to /i/... but drops the
+			// session cookies on the /edit/d/... redirect, which is answered with a captcha.
+			cookies := parseCookieHeader(provided)
+			for _, c := range cookies {
+				if c.Path == "" {
+					c.Path = "/"
+				}
+			}
+			jar.SetCookies(parsed, cookies)
+		}
+	}
+
 	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error { return nil },
-		Timeout:       30 * time.Second,
-		Transport:     &http.Transport{DialContext: transport.ProtectedDialer().DialContext},
+		Jar:       jar,
+		Timeout:   30 * time.Second,
+		Transport: &http.Transport{DialContext: transport.ProtectedDialer().DialContext},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 
-	req, _ := http.NewRequest("GET", url, nil)
-	applyBrowserGetHeaders(req.Header)
-	if provided := t.getProvidedCookies(); provided != "" {
-		req.Header.Set("Cookie", provided)
+	currentURL := url
+	var resp *http.Response
+	var htmlBytes []byte
+	var finalCookies []*http.Cookie
+	var finalURL *neturl.URL
+	captchaAttempts := 0
+	solveChallenge := func() error {
+		if captchaAttempts > 0 {
+			return errCaptchaBlocked
+		}
+		captchaAttempts++
+		t.debugf("captcha challenge detected, solving via PoW")
+		t.EmitEvent(transport.EventCaptchaRequired, url)
+		if t.captchaSolveMode != CaptchaSolveModeNative {
+			return errCaptchaBlocked
+		}
+		if cerr := solveCaptchaIsolated(currentURL, jar, browserUserAgent, client.Transport); cerr != nil {
+			t.debugf("PoW captcha solve failed: %v", cerr)
+			return fmt.Errorf("%w: %v", errCaptchaBlocked, cerr)
+		}
+		t.debugf("PoW captcha solved, retrying")
+		currentURL = url
+		return nil
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return YandexDocsInfo{}, err
-	}
-	defer resp.Body.Close()
 
-	htmlBytes, _ := io.ReadAll(resp.Body)
+	for hop := 0; hop < 10; hop++ {
+		req, _ := http.NewRequest("GET", currentURL, nil)
+		applyBrowserGetHeaders(req.Header)
+		sent := cookieNames(jar.Cookies(req.URL))
+		t.debugf("hop %d GET %s (jar cookies: %s)", hop, shortURL(currentURL), sent)
+		var err error
+		resp, err = client.Do(req)
+		if err != nil {
+			return YandexDocsInfo{}, err
+		}
+		t.debugf("hop %d -> %d %s", hop, resp.StatusCode, resp.Header.Get("Location"))
+
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			htmlBytes, _ = io.ReadAll(resp.Body)
+			finalCookies = resp.Cookies()
+			finalURL = resp.Request.URL
+			resp.Body.Close()
+			if looksLikeCaptchaHTML(htmlBytes) {
+				t.debugf("hop %d returned a captcha page (%d bytes, title %q)", hop, len(htmlBytes), pageTitle(htmlBytes))
+				if err := solveChallenge(); err != nil {
+					return YandexDocsInfo{}, err
+				}
+				continue
+			}
+			break
+		}
+		if resp.StatusCode < 300 || resp.StatusCode >= 400 {
+			resp.Body.Close()
+			return YandexDocsInfo{}, fmt.Errorf("unexpected status %d at %s", resp.StatusCode, currentURL)
+		}
+
+		loc, err := resp.Location()
+		resp.Body.Close()
+		if err != nil {
+			return YandexDocsInfo{}, fmt.Errorf("redirect from %s: %w", currentURL, err)
+		}
+
+		nextURL, err := resp.Request.URL.Parse(loc.String())
+		if err != nil {
+			return YandexDocsInfo{}, fmt.Errorf("redirect from %s: %w", currentURL, err)
+		}
+		if isCaptchaURL(nextURL.String()) {
+			if err := solveChallenge(); err != nil {
+				return YandexDocsInfo{}, err
+			}
+			continue
+		}
+		currentURL = nextURL.String()
+	}
+
+	if resp == nil || len(htmlBytes) == 0 || finalURL == nil {
+		if captchaAttempts > 0 {
+			return YandexDocsInfo{}, errCaptchaBlocked
+		}
+		return YandexDocsInfo{}, fmt.Errorf("no successful response after redirects")
+	}
 	html := string(htmlBytes)
 
 	t.debugf("fetchDocInfo GET %s -> %d (%d bytes)", url, resp.StatusCode, len(html))
 
 	var cookies []string
-	for _, c := range resp.Cookies() {
+	for _, c := range finalCookies {
+		cookies = append(cookies, fmt.Sprintf("%s=%s", c.Name, c.Value))
+	}
+	for _, c := range jar.Cookies(finalURL) {
 		cookies = append(cookies, fmt.Sprintf("%s=%s", c.Name, c.Value))
 	}
 
@@ -1015,6 +1214,13 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 			return YandexDocsInfo{}, errCaptchaBlocked
 		}
 		return YandexDocsInfo{}, fmt.Errorf("config not found")
+	}
+
+	if joined := strings.Join(cookies, "; "); joined != "" {
+		merged := mergeCookieHeaders(joined, t.getProvidedCookies())
+		t.Mu.Lock()
+		t.providedCookies = merged
+		t.Mu.Unlock()
 	}
 
 	var config map[string]interface{}
