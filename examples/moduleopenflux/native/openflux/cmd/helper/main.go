@@ -111,6 +111,8 @@ type ofStrings struct {
 	captchaWindowTitle      string
 	captchaWindowText       string
 	captchaNoHostSupportFmt string // %s — что объявил хост
+	captchaOpenedFmt        string // %s — что объявил хост
+	captchaAnsweredFmt      string // %d cookie, %s откуда
 	captchaClosedLog        string
 	captchaNoCookiesLog     string
 	captchaGotCookiesLog    string
@@ -135,6 +137,8 @@ var ofStringsRU = ofStrings{
 	captchaWindowTitle:      "Проверка Яндекса",
 	captchaWindowText:       "Пройдите проверку в этом окне — оно закроется само, когда проверка будет пройдена.",
 	captchaNoHostSupportFmt: "OpenFlux: хост не объявил ни webview.cookies, ни webview.bridge (объявлено: %s) — окно проверки не сможет вернуть cookie, обновите AntiNet",
+	captchaOpenedFmt:        "OpenFlux: открываю окно проверки (хост объявил: %s)",
+	captchaAnsweredFmt:      "OpenFlux: окно проверки ответило: cookie %d (%s)",
 	captchaClosedLog:        "OpenFlux: окно проверки закрыто без результата",
 	captchaNoCookiesLog:     "OpenFlux: окно проверки не вернуло cookie — хост не отдал их ответом, обновите AntiNet",
 	captchaGotCookiesLog:    "OpenFlux: cookie из окна проверки получены, переподключаю транспорт",
@@ -159,6 +163,8 @@ var ofStringsEN = ofStrings{
 	captchaWindowTitle:      "Yandex check",
 	captchaWindowText:       "Pass the check in this window - it closes by itself once the check is passed.",
 	captchaNoHostSupportFmt: "OpenFlux: the host declares neither webview.cookies nor webview.bridge (declared: %s) - the check window cannot return cookies, update AntiNet",
+	captchaOpenedFmt:        "OpenFlux: opening the check window (host declared: %s)",
+	captchaAnsweredFmt:      "OpenFlux: the check window answered: %d cookies (%s)",
 	captchaClosedLog:        "OpenFlux: the check window was closed without a result",
 	captchaNoCookiesLog:     "OpenFlux: the check window returned no cookies - the host did not hand them back, update AntiNet",
 	captchaGotCookiesLog:    "OpenFlux: cookies from the check window received, reconnecting the transport",
@@ -1011,14 +1017,40 @@ func solveCaptchaByWebView(profileDir, docURL string) (string, bool) {
 	if hostCan("webview.loadBudget") {
 		rule["urlTimeoutSec"] = captchaLoadBudgetSec
 	}
+	sent := make([]string, 0, len(rule))
+	for key := range rule {
+		sent = append(sent, key)
+	}
+	sort.Strings(sent)
+	log.Printf("[WBV] opening id=%s url=%s fields=%v hostFeatures=%q", ids, docURL, sent, hostFeaturesRaw)
+	declared := hostFeaturesRaw
+	if !hostFeaturesDeclared() {
+		declared = "-"
+	}
+	emitLog(ofText.captchaOpenedFmt, declared)
 	res, cancelled := runAction(profileDir, ids, rule)
 	if cancelled {
+		log.Printf("[WBV] id=%s cancelled or timed out", ids)
 		return "", true
 	}
 	jar := actionResultCookieJar(res)
+	via := "host cookies"
 	if len(jar) == 0 {
 		jar = cookiesFromBridgeValue(res)
+		via = "bridge"
 	}
+	names := make([]string, 0, len(jar))
+	for name := range jar {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	envKeys := make([]string, 0, 4)
+	for key := range actionResultEnvelope(res) {
+		envKeys = append(envKeys, key)
+	}
+	sort.Strings(envKeys)
+	log.Printf("[WBV] id=%s answered envelope=%v cookies=%d via=%s names=%v", ids, envKeys, len(jar), via, names)
+	emitLog(ofText.captchaAnsweredFmt, len(jar), via)
 	return cookieHeader(jar), false
 }
 
