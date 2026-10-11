@@ -23,8 +23,8 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"universal-bypass-tool/transport"
-	"universal-bypass-tool/utils"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 const (
@@ -583,6 +583,9 @@ func (t *Transport) connectLoop(boardUID string) {
 
 		t.EmitEvent(transport.EventConnecting, strconv.Itoa(attempt+1))
 
+		if !transport.WaitConnectSlot(t.done) {
+			return
+		}
 		info, err := t.fetchGuestSession(boardUID)
 		established := false
 		if err != nil {

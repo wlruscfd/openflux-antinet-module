@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	"universal-bypass-tool/transport"
-	"universal-bypass-tool/transport/oneme"
-	"universal-bypass-tool/transport/yandex"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/transport/oneme"
+	"github.com/p1neappleXpress/OpenFlux/transport/yandex"
 )
 
 func importLink(t *testing.T, payload map[string]any) string {
@@ -157,6 +157,8 @@ func TestBuildTransportShapes(t *testing.T) {
 		{"volga", openFluxLink{Transport: transportVolga, URL: doc}, false, nil},
 		{"mailru", openFluxLink{Transport: transportMailru, URL: doc}, false, nil},
 		{"mts e2e", openFluxLink{Transport: transportMTS, URL: doc, KeyToken: "k", E2E: true}, false, nil},
+		{"telemost", openFluxLink{Transport: transportTelemost, URL: "https://telemost.yandex.ru/j/1"}, false, nil},
+		{"cupsonline", openFluxLink{Transport: transportCups, URL: "WyJhIl0"}, false, nil},
 		{"oneme", openFluxLink{Transport: transportOneMe, Token: "t", UID: 7}, false, func(t *testing.T, b builtTransport) {
 			if _, ok := b.handover.(*oneme.OneMeTransport); !ok {
 				t.Fatalf("oneme keeps its own Handover, got %T", b.handover)

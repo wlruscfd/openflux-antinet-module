@@ -26,8 +26,8 @@ import (
 	"github.com/gorilla/websocket"
 	"golang.org/x/crypto/chacha20poly1305"
 
-	"universal-bypass-tool/transport"
-	"universal-bypass-tool/utils"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 // writerLoop batches queued packets into one length-prefixed blob (Volga's framing) instead of one WS frame per packet, since per-message overhead dominates at higher packet rates.
@@ -49,6 +49,116 @@ const (
 	ydocsBatchMaxBytes = 4 * 1024 * 1024
 )
 
+// ---------- saveChanges: шаблоны и сборка ----------
+//
+// В дампе веб-клиента каждое поле фиксировано; вариативны только:
+//
+//   - UserId / UserShortId  — id участника (из editor_config.user.id);
+//   - cursorOps             — позиции/состояние каретки (по одному на сдвиг);
+//   - appVersion            — версия клиента (в оп-метаданных, зашита в base64).
+//
+// Формат самих оп — закрытый бинарник редактора. Мы не пытаемся его
+// изобрести заново: воспроизводим ровно тот же префикс-entity и
+// base64-полезную нагрузку, что и оригинал, а меняем лишь то, что реально
+// можно менять, не порождая «мусорных» операций.
+//
+// modelMetaOp — служебный оп модели: заголовок сессии + версия клиента.
+// Он не зависит от пользователя, но привязан к версии editor’а. Менять его
+// содержимое нельзя без смены формата; вынесен отдельной константой, чтобы
+// при апдейте редактора его можно было заменить одной строкой.
+const (
+	modelMetaOp  = "76;AgAAADEA//8BAJ+fl7jkAwIALQEAAAMAAAAAAAAAAAAAAAAAAAAAAAAA9v///xoAAAAyADAAMgA2AC4AMgAuADEALgAyADIANgA4AA=="
+	entityCursor = "35" // id потока курсора (совпадает с оригиналом)
+	cursorStream = "14" // id курсор-потока в CursorInfo
+)
+
+// cursorOp собирает один курсор-оп: "<entity>;<base64>". Base64-нагрузка —
+// та же форма, что в дампе (4-байтовый заголовок длины строки, затем строка
+// userShortID в UTF-16LE, затем фиксированные поля и байт seq), но с
+// настоящим userShortID и меняющимся счётчиком seq, поэтому каждое
+// сообщение отличается и выглядит живой активностью.
+func cursorOp(userShortID string, seq int) string {
+	payload := make([]byte, 0, 32)
+	payload = append(payload, 0x06, 0x00, 0x00, 0x00) // длина строки = 6 (UTF-16 units)
+	for _, r := range userShortID {
+		payload = append(payload, byte(r), 0x00)
+	}
+	payload = append(payload,
+		0x01, 0x00, 0x1c, 0x00, // позиция/флаг курсора
+		0x01, 0x00, 0x00, 0x00,
+		byte(seq), 0x00, 0x00, 0x00,
+		0x01, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+	)
+	return entityCursor + ";" + base64.StdEncoding.EncodeToString(payload)
+}
+
+// cursorInfo строит CursorInfo-строку: "<stream>;<base64>". В base64 лежит
+// 6-байтовая строка userShortID (UTF-16LE) и 4 байта позиции; формат ровно
+// такой же, как в дампе, но id и позиция — настоящие.
+func cursorInfo(userShortID string, seq int) string {
+	payload := make([]byte, 0, 16)
+	payload = append(payload, 0x06, 0x00, 0x00, 0x00)
+	for _, r := range userShortID {
+		payload = append(payload, byte(r), 0x00)
+	}
+	payload = append(payload, 0x03, 0x00, 0x00, 0x00, byte(seq), 0x00)
+	return cursorStream + ";" + base64.StdEncoding.EncodeToString(payload)
+}
+
+// BuildSaveChanges is the saveChanges message for one participant and
+// iteration (see buildSaveChanges for how the pieces are chosen). A pure
+// function of its arguments, exported so the JS port of this transport can be
+// compared with it byte for byte.
+func BuildSaveChanges(userID string, isExcel bool, seq int) []byte {
+	short := userID
+	if len(short) > 10 {
+		short = short[:10]
+	}
+
+	changes := []string{
+		modelMetaOp,
+		cursorOp(short, seq),
+		cursorOp(short, seq+1),
+		cursorOp(short, seq+2),
+	}
+	changesJSON, _ := json.Marshal(changes) // ["...","..."]
+
+	excelInfo := map[string]string{
+		"UserId":      userID,
+		"UserShortId": short,
+		"CursorInfo":  cursorInfo(short, seq),
+	}
+	excelJSON, _ := json.Marshal(excelInfo)
+
+	msg := map[string]interface{}{
+		"type":                "saveChanges",
+		"changes":             string(changesJSON),
+		"startSaveChanges":    true,
+		"endSaveChanges":      true,
+		"isCoAuthoring":       true,
+		"isExcel":             isExcel,
+		"deleteIndex":         nil,
+		"excelAdditionalInfo": string(excelJSON),
+		"unlock":              false,
+		"releaseLocks":        true,
+	}
+	body, _ := json.Marshal([]interface{}{"message", msg})
+	return append([]byte("42"), body...)
+}
+
+// buildSaveChanges собирает saveChanges-сообщение под конкретную сессию и
+// номер итерации: актуальные UserId/UserShortId и слегка меняющиеся позиции
+// курсора. Оригинальные entity-префиксы и модель-оп сохранены побайтово;
+// меняется только то, что действительно зависит от участника.
+func (t *YandexDocsTransport) buildSaveChanges(session *DocSession, seq int) []byte {
+	userID := session.Info.EditorUserID
+	if userID == "" {
+		userID = session.UserID // fallback: псевдо-id, если jwt не дал реального
+	}
+	return BuildSaveChanges(userID, session.Info.IsExcel, seq)
+}
 // wsWriteTimeout bounds every WebSocket write; without it a stalled write blocks writerLoop, the one goroutine draining a session's queue, forever.
 const wsWriteTimeout = 10 * time.Second
 
@@ -76,16 +186,18 @@ const captchaCooldown = 3 * time.Minute
 const cookieRetryFloor = 5 * time.Second
 
 type YandexDocsInfo struct {
-	CookieStr   string
-	Token       string
-	DocID       string
-	CallbackURL string
-	UserID      string
-	Origin      string
-	Host        string
-	WsURL       string
-	Permissions map[string]interface{}
-	OpenCmd     map[string]interface{}
+	CookieStr    string
+	Token        string
+	DocID        string
+	CallbackURL  string
+	UserID       string
+	EditorUserID string // editor_config.user.id: настоящий id участника в документе
+	IsExcel      bool   // editor_config.document.fileType ∈ {xlsx,xls,xlsm,csv}
+	Origin       string
+	Host         string
+	WsURL        string
+	Permissions  map[string]interface{}
+	OpenCmd      map[string]interface{}
 }
 
 type DocSession struct {
@@ -122,10 +234,6 @@ type YandexDocsTransport struct {
 
 	peerBatches atomic.Bool
 
-	// ⚠️ ANTI-NET DIVERGENCE (не из openflux-server): момент последнего кадра ОТ ПИРА.
-	// Поле нужно для peerSilent() — см. peer_silence.go. Не удалять при переносе апстрима.
-	lastPeerMsgAtNano atomic.Int64
-
 	// peerZstdBatches is peerBatches' counterpart for zstdBatchMarker.
 	peerZstdBatches atomic.Bool
 
@@ -140,6 +248,7 @@ type YandexDocsTransport struct {
 	peerEncSelfCompress atomic.Bool
 
 	wakeReconnect chan struct{}
+	reconnecting  atomic.Bool
 
 	// tag identifies this instance's log lines on a node running many keys at once - a bare "[YDOCS]" line can't otherwise be traced back to which key it belongs to.
 	tag string
@@ -356,6 +465,7 @@ func (t *YandexDocsTransport) Start() error {
 
 	t.baseUserID = randUserID()
 	go t.keepAliveLoop()
+	utils.SafeGo("yandex.editorActivity", t.editorActivityLoop)
 	t.connectToDoc(0)
 
 	return nil
@@ -407,6 +517,9 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 	t.EmitEvent(transport.EventConnecting, strconv.Itoa(attempt+1))
 
 	go func() {
+		if !transport.WaitConnectSlot(t.Done()) {
+			return
+		}
 		t.Mu.Lock()
 		existingSession := t.session
 		t.Mu.Unlock()
@@ -520,9 +633,6 @@ func (t *YandexDocsTransport) connectToDoc(attempt int) {
 		for t.IsRunning() {
 			conn.SetReadDeadline(time.Now().Add(readTimeout))
 			_, message, err := conn.ReadMessage()
-			if err == nil {
-				t.notePeerMsg()
-			}
 			if err != nil {
 				t.debugf("Read error: %v", err)
 				t.SetConnected(false)
@@ -691,8 +801,7 @@ func (t *YandexDocsTransport) sendBatch(session *DocSession, batch [][]byte) {
 		t.debugf("-> %d bytes (%d packets)\n", len(framed), len(batch))
 	}
 
-	payload := base64.StdEncoding.EncodeToString(framed)
-	msg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"18;%s"}]`, payload)
+	msg := cursorMessage(framed)
 
 	if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
 		t.debugf("Write error: %v", err)
@@ -710,8 +819,7 @@ func (t *YandexDocsTransport) sendZstdBatch(session *DocSession, batch [][]byte)
 		t.debugf("-> %d bytes (%d packets, zstd batch)\n", len(framed), len(batch))
 	}
 
-	payload := base64.StdEncoding.EncodeToString(framed)
-	msg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"18;%s"}]`, payload)
+	msg := cursorMessage(framed)
 
 	if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
 		t.debugf("Write error: %v", err)
@@ -735,8 +843,7 @@ func (t *YandexDocsTransport) sendEncryptedZstdBatch(session *DocSession, batch 
 		t.debugf("-> %d bytes (%d packets, encrypted zstd batch)\n", len(ciphertext), len(batch))
 	}
 
-	payload := base64.StdEncoding.EncodeToString(ciphertext)
-	msg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"18;%s"}]`, payload)
+	msg := cursorMessage(ciphertext)
 
 	if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
 		t.debugf("Write error: %v", err)
@@ -749,12 +856,15 @@ func (t *YandexDocsTransport) sendSingle(session *DocSession, packet []byte) {
 		t.debugf("-> %d bytes (unbatched)\n", len(packet))
 	}
 
-	payload := base64.StdEncoding.EncodeToString(packet)
-	msg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"18;%s"}]`, payload)
+	msg := cursorMessage(packet)
 
 	if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
 		t.debugf("Write error: %v", err)
 	}
+}
+
+func cursorMessage(raw []byte) string {
+	return fmt.Sprintf(`42["message",{"type":"cursor","cursor":"%d;%s"}]`, len(raw), base64.StdEncoding.EncodeToString(raw))
 }
 
 func (t *YandexDocsTransport) markSent(data []byte) {
@@ -809,14 +919,47 @@ func (t *YandexDocsTransport) keepAliveLoop() {
 				t.debugf("Keep-alive failed: %v", err)
 				t.SetConnected(false)
 				session.Conn.Close()
-			} else if t.peerSilent() {
-				// ⚠️ ANTI-NET DIVERGENCE: пир молчит, писать по-прежнему выходит, но exit-узел
-				// исчез из документа и эта сессия уже не понесёт трафик. Рвём её так же, как
-				// неудачную запись, чтобы read loop перезвонил. Логика — в peer_silence.go.
-				utils.Debugf("[YDOCS] peer silent — dropping session to re-dial")
-				t.SetConnected(false)
-				session.Conn.Close()
 			}
+		}
+	}
+}
+
+// editorActivityLoop периодически отправляет в документ saveChanges-сообщение,
+// собранное под текущую сессию (см. buildSaveChanges): актуальные
+// UserId/UserShortId и слегка меняющиеся позиции курсора. Задержка между
+// отправками — случайная в диапазоне [0.5 с, 5 с], чтобы поток выглядел как
+// правки живого человека: ровный по сути, но не метрономом. Сообщение уходит
+// через ту же сессию, что writerLoop и keepAliveLoop, и так же терпит
+// переподключение — если сессии сейчас нет, итерация просто пропускается.
+func (t *YandexDocsTransport) editorActivityLoop() {
+	const (
+		minDelay = 500 * time.Millisecond
+		maxDelay = 5 * time.Second
+	)
+	seq := 0
+	for t.IsRunning() {
+		span := int64(maxDelay - minDelay)
+		delay := minDelay + time.Duration(rand.Int63n(span+1))
+
+		select {
+		case <-time.After(delay):
+		case <-t.Done():
+			return
+		}
+
+		t.Mu.RLock()
+		session := t.session
+		t.Mu.RUnlock()
+		if session == nil || session.Conn == nil {
+			continue // mid-reconnect: nothing to write into
+		}
+
+		seq++
+		msg := t.buildSaveChanges(session, seq)
+		if err := session.safeWrite(websocket.TextMessage, msg); err != nil {
+			utils.Debugf("[YDOCS] saveChanges write error: %v", err)
+			// Держим цикл: следующая итерация попробует снова, а
+			// переподключение (keepAliveLoop / reader) поднимет новый conn.
 		}
 	}
 }
@@ -965,6 +1108,15 @@ func (t *YandexDocsTransport) handleEncryptedMessage(decoded []byte) {
 }
 
 func (t *YandexDocsTransport) extractBase64String(response string) string {
+	return ExtractBase64(response)
+}
+
+// ExtractBase64 pulls the packet payload out of a server frame: from a
+// saveChanges message's excelAdditionalInfo, otherwise from a cursor field.
+// Pure, and exported so the JS port can be compared with it.
+var cursorPayloadRe = regexp.MustCompile(`"cursor":"([0-9]+);([^"]+)"`)
+
+func ExtractBase64(response string) string {
 	if strings.Contains(response, "saveChanges") {
 		marker := `"excelAdditionalInfo":"`
 		left := strings.Index(response, marker) + len(marker)
@@ -978,11 +1130,21 @@ func (t *YandexDocsTransport) extractBase64String(response string) string {
 		return response[left : left+right]
 	}
 
-	// Anchored on our own literal "18;" marker (see sendBatch/sendSingle/etc.), not just any cursor value with a semicolon - a real participant's own cursor broadcast (this is a real collaborative doc, other Yandex users' cursors go out the same "cursor" field) matched the old, looser pattern too, handing their cursor position to CallReceive as if it were tunnel data.
-	re := regexp.MustCompile(`"cursor":"18;([^"]+)"`)
-	matches := re.FindStringSubmatch(response)
-	if len(matches) > 1 {
-		return matches[1]
+	// A real participant's own cursor broadcast goes out the same "cursor" field, so a value only counts as ours when its numeric prefix is the decoded packet length (or the legacy fixed 18) or it is a keepalive.
+	matches := cursorPayloadRe.FindStringSubmatch(response)
+	if len(matches) > 2 {
+		prefix, payload := matches[1], matches[2]
+		if strings.HasPrefix(payload, "---KA---") {
+			return payload
+		}
+		if n, err := strconv.Atoi(prefix); err == nil {
+			if n == 18 {
+				return payload
+			}
+			if raw, derr := base64.StdEncoding.DecodeString(payload); derr == nil && len(raw) == n {
+				return payload
+			}
+		}
 	}
 	return ""
 }
@@ -993,6 +1155,10 @@ func (t *YandexDocsTransport) scheduleReconnect(attempt int, reasonCode string, 
 
 func (t *YandexDocsTransport) scheduleReconnectWithMinDelay(attempt int, reasonCode string, cause error, minDelay time.Duration) {
 	if !t.IsRunning() || attempt >= t.GetConfig().MaxReconnectAttempts {
+		return
+	}
+
+	if !t.reconnecting.CompareAndSwap(false, true) {
 		return
 	}
 
@@ -1031,6 +1197,7 @@ func (t *YandexDocsTransport) scheduleReconnectWithMinDelay(attempt int, reasonC
 		}
 		t.Mu.Unlock()
 	}
+	t.reconnecting.Store(false)
 	if !t.IsRunning() {
 		return
 	}
@@ -1272,14 +1439,28 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 		perms = make(map[string]interface{})
 	}
 
+	// editor_config.user.id — настоящий id участника в документе: под него
+	// сервер подписывает presence/курсоры, и именно его нужно нести в
+	// saveChanges (иначе auth-сессия и saveChanges разойдутся).
+	editorUserID := ""
+	if userObj, ok := editorConfigRaw["user"].(map[string]interface{}); ok {
+		if s, ok := userObj["id"].(string); ok {
+			editorUserID = s
+		}
+	}
+	fileType, _ := document["fileType"].(string)
+	isExcel := isExcelFile(fileType)
+
 	return YandexDocsInfo{
-		CookieStr:   strings.Join(cookies, "; "),
-		Token:       token,
-		DocID:       docKey,
-		Origin:      balancerURL,
-		Host:        host,
-		WsURL:       fmt.Sprintf("wss://%s/2024.1.1-375/doc/%s/c/?EIO=4&transport=websocket", host, docKey),
-		Permissions: perms,
+		CookieStr:    strings.Join(cookies, "; "),
+		Token:        token,
+		DocID:        docKey,
+		Origin:       balancerURL,
+		Host:         host,
+		EditorUserID: editorUserID,
+		IsExcel:      isExcel,
+		WsURL:        fmt.Sprintf("wss://%s/2024.1.1-375/doc/%s/c/?EIO=4&transport=websocket", host, docKey),
+		Permissions:  perms,
 		OpenCmd: map[string]interface{}{
 			"c":      "open",
 			"id":     docKey,
@@ -1290,6 +1471,16 @@ func (t *YandexDocsTransport) fetchDocInfo(url, userID string) (YandexDocsInfo, 
 			"lcid":   25,
 		},
 	}, nil
+}
+
+// isExcelFile — таблица ли это, по fileType из editor_config.document.
+// От этого зависит поле isExcel в saveChanges.
+func isExcelFile(fileType string) bool {
+	switch strings.ToLower(strings.TrimPrefix(fileType, ".")) {
+	case "xlsx", "xls", "xlsm", "csv":
+		return true
+	}
+	return false
 }
 
 func randUserID() string {

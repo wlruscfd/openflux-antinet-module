@@ -6,7 +6,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"universal-bypass-tool/transport"
+	"github.com/p1neappleXpress/OpenFlux/transport"
 )
 
 func protectedWSDialer() *websocket.Dialer {
@@ -27,13 +27,6 @@ func logInfo(format string, args ...interface{}) {
 
 func logError(format string, args ...interface{}) {
 	fmt.Printf("[ERR] "+format+"\n", args...)
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 func genUUID() string {

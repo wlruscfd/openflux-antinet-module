@@ -31,13 +31,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"universal-bypass-tool/transport"
-	"universal-bypass-tool/transport/mailru"
-	"universal-bypass-tool/transport/mts"
-	"universal-bypass-tool/transport/oneme"
-	"universal-bypass-tool/transport/yandex"
-	"universal-bypass-tool/tunnel"
-	"universal-bypass-tool/utils"
+	"github.com/p1neappleXpress/OpenFlux/nodetunnel"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/transport/cupsonline"
+	"github.com/p1neappleXpress/OpenFlux/transport/mailru"
+	"github.com/p1neappleXpress/OpenFlux/transport/mts"
+	"github.com/p1neappleXpress/OpenFlux/transport/oneme"
+	"github.com/p1neappleXpress/OpenFlux/transport/yandex"
+	"github.com/p1neappleXpress/OpenFlux/utils"
 )
 
 // ── Ссылка ────────────────────────────────────────────────────────────────────────────────────
@@ -67,20 +68,22 @@ import (
 // и не заменяет её: они разбираются одним декодером (parseOpenFluxLink), различаясь только первым
 // сегментом (`import` вместо имени транспорта).
 const (
-	linkScheme       = "openflux"
-	linkHostImport   = "import" // openflux://import?data=... — см. decodeImportLink
-	transportYandex  = "yandex"
-	transportOneMe   = "oneme"
-	transportVolga   = "volga"
-	transportMailru  = "mailru"
-	transportBoards  = "boards"
-	transportMTS     = "mts"
-	transportMulti   = "yandex_multistream"
-	defaultDialSec   = 15
-	defaultKeepSec   = 10
-	readyWaitBudget  = 90 * time.Second // см. waitTransportUp
-	transportUpPoll  = 200 * time.Millisecond
-	dnsQueryFamilyV4 = 4
+	linkScheme        = "openflux"
+	linkHostImport    = "import" // openflux://import?data=... — см. decodeImportLink
+	transportYandex   = "yandex"
+	transportOneMe    = "oneme"
+	transportVolga    = "volga"
+	transportMailru   = "mailru"
+	transportBoards   = "boards"
+	transportMTS      = "mts"
+	transportTelemost = "telemost"
+	transportCups     = "cupsonline"
+	transportMulti    = "yandex_multistream"
+	defaultDialSec    = 15
+	defaultKeepSec    = 10
+	readyWaitBudget   = 90 * time.Second // см. waitTransportUp
+	transportUpPoll   = 200 * time.Millisecond
+	dnsQueryFamilyV4  = 4
 )
 
 // ── Локализация текста для юзера (MODULE_API §2.9) ────────────────────────────────────────────
@@ -197,7 +200,7 @@ type openFluxLink struct {
 
 func isDocTransport(name string) bool {
 	switch name {
-	case transportYandex, transportVolga, transportMailru, transportBoards, transportMTS:
+	case transportYandex, transportVolga, transportMailru, transportBoards, transportMTS, transportTelemost, transportCups:
 		return true
 	}
 	return false
@@ -282,8 +285,8 @@ func parseOpenFluxLink(raw string) (openFluxLink, error) {
 		}
 		l.UID = uid
 	default:
-		return l, fmt.Errorf("unknown transport %q (want %s|%s|%s|%s|%s|%s|%s)", l.Transport,
-			transportYandex, transportVolga, transportMailru, transportBoards, transportMTS, transportMulti, transportOneMe)
+		return l, fmt.Errorf("unknown transport %q (want %s|%s|%s|%s|%s|%s|%s|%s|%s)", l.Transport,
+			transportYandex, transportVolga, transportMailru, transportBoards, transportMTS, transportTelemost, transportCups, transportMulti, transportOneMe)
 	}
 	return l, nil
 }
@@ -489,8 +492,8 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	s := ofStringsFor(cfg["APP_LANG"])
 	ofText = s
 	hostFeaturesRaw = cfg["HOST_FEATURES"]
-	log.Printf("host features: %q", hostFeaturesRaw)          // §2.9: текст для юзера — на языке AntiNet
-	port, _ := strconv.Atoi(cfg["LISTEN_PORT"]) // 0 = эфемерный (ядро выберет)
+	log.Printf("host features: %q", hostFeaturesRaw) // §2.9: текст для юзера — на языке AntiNet
+	port, _ := strconv.Atoi(cfg["LISTEN_PORT"])      // 0 = эфемерный (ядро выберет)
 	user := cfg["SOCKS_USER"]
 	pass := cfg["SOCKS_PASS"]
 
@@ -655,7 +658,7 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 		log.Fatalf("transport did not come up within %s", readyWaitBudget)
 	}
 
-	tun := tunnel.NewTCPTunnel(trans, false)
+	tun := nodetunnel.NewTCPTunnel(trans, false)
 
 	ln, err := openListener(port, listenFd)
 	if err != nil {
@@ -693,7 +696,7 @@ type builtTransport struct {
 
 type reconnectHandover struct{ t transport.Transport }
 
-func (r reconnectHandover) Handover() { r.t.ForceReconnect() }
+func (r reconnectHandover) Handover() { transport.ForceReconnect(r.t) }
 
 // buildTransport повторяет сборку клиента openflux-server (mobile.buildTransport): способ упаковки
 // и шифрования обязан совпасть с тем, что ждёт exit-node для этого ключа, иначе транспорт поднимется,
@@ -702,7 +705,7 @@ func buildTransport(link openFluxLink, tcfg transport.TransportConfig, mode capt
 	e2e := link.E2E && link.KeyToken != ""
 	wrapGeneric := func(inner transport.Transport) transport.Transport {
 		if e2e {
-			inner = transport.NewEncryptedTransport(inner, link.KeyToken, false)
+			inner = transport.NewTokenEncryptedTransport(inner, link.KeyToken, false)
 		}
 		return transport.NewCompressedTransport(inner)
 	}
@@ -741,15 +744,21 @@ func buildTransport(link openFluxLink, tcfg transport.TransportConfig, mode capt
 		bt.SetCaptchaSolveMode(captchaSolveModeFor(mode))
 		var inner transport.Transport = bt
 		if e2e {
-			inner = transport.NewEncryptedTransport(inner, link.KeyToken, false)
+			inner = transport.NewTokenEncryptedTransport(inner, link.KeyToken, false)
 		}
-		return builtTransport{trans: transport.NewBatchedTransport(inner), handover: reconnectHandover{bt}, cookies: bt}, nil
+		return builtTransport{trans: yandex.NewBoardsBatched(inner), handover: reconnectHandover{bt}, cookies: bt}, nil
 	case transportMailru:
 		mt := mailru.NewMailruDocsTransport(link.URL, tcfg)
 		return builtTransport{trans: wrapGeneric(mt), handover: reconnectHandover{mt}}, nil
 	case transportMTS:
 		st := mts.NewTransport(link.URL, tcfg)
 		return builtTransport{trans: wrapGeneric(st), handover: reconnectHandover{st}}, nil
+	case transportTelemost:
+		tt := yandex.NewTelemostBatched(link.URL, false, tcfg)
+		return builtTransport{trans: tt, handover: reconnectHandover{tt}}, nil
+	case transportCups:
+		ct := cupsonline.NewCupsonlineTransport(link.URL, tcfg, true)
+		return builtTransport{trans: transport.NewBatchedTransport(ct), handover: reconnectHandover{ct}}, nil
 	case transportOneMe:
 		ot := oneme.NewOneMeTransport(false, link.Token, link.UID, tcfg)
 		return builtTransport{trans: wrapGeneric(ot), handover: ot}, nil
@@ -832,7 +841,7 @@ func waitTransportUpFor(t transport.Transport, budget time.Duration) bool {
 
 // handleConn — CONNECT-путь модуля. Сам протокол SOCKS5 (приветствие, user/pass, разбор запроса,
 // реле) — канон shared/socks5; модулю принадлежит только ТРАНСПОРТ: дозвон через свой туннель.
-func handleConn(c net.Conn, user, pass string, tun *tunnel.TCPTunnel, resolver *protectedResolver, dialTimeout time.Duration) {
+func handleConn(c net.Conn, user, pass string, tun *nodetunnel.TCPTunnel, resolver *protectedResolver, dialTimeout time.Duration) {
 	defer c.Close()
 	br := bufio.NewReader(c)
 
@@ -1161,11 +1170,11 @@ func attachCaptchaSolver(trans transport.Transport, provider transport.CookiePro
 			}
 			emitLog(ofText.captchaGotCookiesLog)
 			provider.ProvideCookies(jar)
-			trans.ForceReconnect()
+			transport.ForceReconnect(trans)
 		}()
 	}
 
-	trans.SetEventCallback(func(code, detail string) {
+	transport.SetEventCallback(trans, func(code, detail string) {
 		switch code {
 		case transport.EventRetrying:
 			parts := strings.SplitN(detail, "|", 4)

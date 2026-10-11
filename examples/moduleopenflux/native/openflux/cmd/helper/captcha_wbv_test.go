@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"universal-bypass-tool/transport"
-	"universal-bypass-tool/transport/yandex"
+	"github.com/p1neappleXpress/OpenFlux/transport"
+	"github.com/p1neappleXpress/OpenFlux/transport/yandex"
 )
 
 func TestCookieHeader(t *testing.T) {
