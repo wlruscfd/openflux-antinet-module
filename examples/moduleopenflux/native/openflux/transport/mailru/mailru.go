@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -60,6 +61,15 @@ func (t *MailruDocsTransport) userAgent() string {
 	return l[int(t.uaIdx.Load())%len(l)]
 }
 
+// The document server refuses a cursor whose number is not the real byte length of its payload and drops the connection with "access deny".
+const keepAliveRaw = "---KA---"
+
+var keepAliveB64 = base64.StdEncoding.EncodeToString([]byte(keepAliveRaw))
+
+func cursorMessage(raw []byte) string {
+	return fmt.Sprintf(`42["message",{"type":"cursor","cursor":"%d;%s"}]`, len(raw), base64.StdEncoding.EncodeToString(raw))
+}
+
 var cursorPayloadRe = regexp.MustCompile(`"cursor":"[^;]+;([^"]+)"`)
 
 // saveChangesMessageTemplate — шаблон saveChanges-сообщения в формате
@@ -84,6 +94,9 @@ type MailruDocsInfo struct {
 	CallbackURL  string
 	EditorUserID string
 }
+
+// One shared transport: a fresh one per call kept an idle connection open for every fetch of every key.
+var mailruHTTP = sync.OnceValue(transport.ProtectedHTTPTransport)
 
 type DocSession struct {
 	Info       MailruDocsInfo
@@ -236,7 +249,9 @@ func (t *MailruDocsTransport) Start() error {
 
 	t.baseUserID = randUserID()
 	utils.SafeGo("mailru.keepAlive", t.keepAliveLoop)
-	utils.SafeGo("mailru.editorActivity", t.editorActivityLoop)
+	if os.Getenv("OPENFLUX_MAILRU_ACTIVITY") == "1" {
+		utils.SafeGo("mailru.editorActivity", t.editorActivityLoop)
+	}
 	t.connectToDoc(0)
 
 	return nil
@@ -472,9 +487,7 @@ func (t *MailruDocsTransport) writerLoop() {
 			continue
 		}
 
-		payload := base64.StdEncoding.EncodeToString(pending)
-		msg := fmt.Sprintf(`42["message",{"type":"cursor","cursor":"18;%s"}]`, payload)
-		if err := session.safeWrite(websocket.TextMessage, []byte(msg)); err != nil {
+		if err := session.safeWrite(websocket.TextMessage, []byte(cursorMessage(pending))); err != nil {
 			utils.Debugf("[M-DOCS] Write error: %v", err)
 			time.Sleep(15 * time.Millisecond)
 			continue
@@ -486,7 +499,7 @@ func (t *MailruDocsTransport) writerLoop() {
 func (t *MailruDocsTransport) keepAliveLoop() {
 	ticker := time.NewTicker(t.GetConfig().KeepAliveInterval)
 	defer ticker.Stop()
-	keepAliveMsg := `42["message",{"type":"cursor","cursor":"18;---KA---"}]`
+	keepAliveMsg := cursorMessage([]byte(keepAliveRaw))
 
 	for t.IsRunning() {
 		<-ticker.C
@@ -604,6 +617,9 @@ func (t *MailruDocsTransport) handleMessage(session *DocSession, data []byte) {
 				utils.Debugf("[M-DOCS] Base64 decode error: %v", err)
 				continue
 			}
+			if string(decoded) == keepAliveRaw {
+				continue
+			}
 			t.RecordReceive(len(decoded))
 			t.CallReceive(decoded)
 		}
@@ -619,7 +635,7 @@ func cursorPayloads(text string) []string { return CursorPayloads(text) }
 func CursorPayloads(text string) []string {
 	var out []string
 	for _, m := range cursorPayloadRe.FindAllStringSubmatch(text, -1) {
-		if len(m) > 1 && m[1] != "---KA---" {
+		if len(m) > 1 && m[1] != "---KA---" && m[1] != keepAliveB64 {
 			out = append(out, m[1])
 		}
 	}
@@ -679,7 +695,7 @@ func (t *MailruDocsTransport) fetchDocInfo(weblink string) (MailruDocsInfo, erro
 			return MailruDocsInfo{}, err
 		}
 	}
-	client := &http.Client{Jar: jar, Timeout: 15 * time.Second, Transport: transport.ProtectedHTTPTransport()}
+	client := &http.Client{Jar: jar, Timeout: 15 * time.Second, Transport: mailruHTTP()}
 
 	reqBody := map[string]string{
 		"x-email":  "anonym",
