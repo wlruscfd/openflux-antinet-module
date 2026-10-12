@@ -659,6 +659,7 @@ func realMain(configContent, resolversPath, profileDir, protectPath string, list
 	}
 
 	tun := nodetunnel.NewTCPTunnel(trans, false)
+	tun.TuneFor(link.Transport)
 
 	ln, err := openListener(port, listenFd)
 	if err != nil {
